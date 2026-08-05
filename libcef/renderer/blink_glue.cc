@@ -5,6 +5,9 @@
 
 #include "cef/libcef/renderer/blink_glue.h"
 
+#include <algorithm>
+#include <array>
+
 #include "third_party/blink/public/mojom/v8_cache_options.mojom-blink.h"
 #include "third_party/blink/public/platform/web_string.h"
 #include "third_party/blink/public/platform/web_url_response.h"
@@ -21,6 +24,7 @@
 #include "third_party/blink/renderer/core/dom/node.h"
 #include "third_party/blink/renderer/core/editing/serializers/serialization.h"
 #include "third_party/blink/renderer/core/execution_context/execution_context.h"
+#include "third_party/blink/renderer/core/execution_context/hodos_session_cache.h"
 #include "third_party/blink/renderer/core/execution_context/execution_context_lifecycle_state_observer.h"
 #include "third_party/blink/renderer/core/exported/web_view_impl.h"
 #include "third_party/blink/renderer/core/frame/frame_owner.h"
@@ -323,6 +327,32 @@ void SetUseExternalPopupMenus(blink::WebView* view, bool value) {
       ->GetPage()
       ->GetChromeClient()
       .SetUseExternalPopupMenus(value);
+}
+
+void SetHodosFarblingKey(blink::WebLocalFrame* frame,
+                         const uint8_t* key32,
+                         bool farbling_enabled) {
+  if (!frame || !key32) {
+    return;
+  }
+  auto* web_frame_impl = blink::To<blink::WebLocalFrameImpl>(frame);
+  if (!web_frame_impl) {
+    return;
+  }
+  blink::LocalFrame* local_frame = web_frame_impl->GetFrame();
+  if (!local_frame) {
+    return;
+  }
+  // Detached or not-yet-initialised frames have no window; there is nothing to
+  // attach a Supplement to and no document that could read a farbled value.
+  blink::LocalDOMWindow* window = local_frame->DomWindow();
+  if (!window) {
+    return;
+  }
+
+  std::array<uint8_t, 32> key{};
+  std::copy(key32, key32 + key.size(), key.begin());
+  blink::HodosSessionCache::From(*window).SetOriginKey(key, farbling_enabled);
 }
 
 }  // namespace blink_glue

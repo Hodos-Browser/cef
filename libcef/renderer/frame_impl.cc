@@ -4,6 +4,9 @@
 
 #include "cef/libcef/renderer/frame_impl.h"
 
+#include <array>
+#include <cstdio>
+
 #include "build/build_config.h"
 
 // Enable deprecation warnings on Windows. See http://crbug.com/585142.
@@ -50,6 +53,10 @@
 #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
 
 namespace {
+
+// Hodos C2: browser -> renderer farbling key. Consumed inside libcef and never
+// surfaced to the client; see CefFrameImpl::SendMessage.
+constexpr char kHodosFarblingKeyMessage[] = "hodos_farble_key";
 
 // Maximum number of times to retry the browser connection.
 constexpr size_t kConnectionRetryMaxCt = 3U;
@@ -450,6 +457,45 @@ void CefFrameImpl::OnDetached() {
   }
 }
 
+void CefFrameImpl::HandleHodosFarblingKey(const base::ListValue& arguments) {
+  // Payload: [0] = 64 lowercase hex chars (the 32-byte per-origin key),
+  //          [1] = bool, the browser's already-collapsed ShouldFarble verdict.
+  const auto& list = arguments.GetList();
+  if (list.size() < 2 || !list[0].is_string() || !list[1].is_bool()) {
+    LOG(WARNING) << "Hodos: malformed farbling key payload; not farbling "
+                 << frame_debug_str_;
+    return;
+  }
+
+  const std::string& hex = list[0].GetString();
+  std::array<uint8_t, 32> key{};
+  if (hex.size() != key.size() * 2) {
+    LOG(WARNING) << "Hodos: farbling key wrong length; not farbling "
+                 << frame_debug_str_;
+    return;
+  }
+  for (size_t i = 0; i < key.size(); ++i) {
+    unsigned int byte = 0;
+    if (std::sscanf(hex.c_str() + i * 2, "%2x", &byte) != 1) {
+      // Reject wholesale rather than farbling with a partially decoded key: a
+      // half-random key is not a weaker secret, it is a different fingerprint.
+      LOG(WARNING) << "Hodos: farbling key not valid hex; not farbling "
+                   << frame_debug_str_;
+      return;
+    }
+    key[i] = static_cast<uint8_t>(byte);
+  }
+
+  const bool enabled = list[1].GetBool();
+  ExecuteOnLocalFrame(
+      __FUNCTION__,
+      base::BindOnce(
+          [](std::array<uint8_t, 32> k, bool en, blink::WebLocalFrame* frame) {
+            blink_glue::SetHodosFarblingKey(frame, k.data(), en);
+          },
+          key, enabled));
+}
+
 void CefFrameImpl::ExecuteOnLocalFrame(const std::string& function_name,
                                        LocalFrameAction action) {
   CEF_REQUIRE_RT_RETURN_VOID();
@@ -815,6 +861,23 @@ void CefFrameImpl::FrameAttachedAck(bool allow) {
 
 void CefFrameImpl::SendMessage(const std::string& name,
                                base::ListValue arguments) {
+  // Hodos C2: the farbling key is consumed here rather than forwarded to the client.
+  //
+  // It is deliberately NOT a public CEF API. The key has to end up inside Blink, and
+  // the client (cef-native) cannot reach Blink internals -- but libcef can, via
+  // blink_glue. Routing it through a CefFrame method would mean a new public virtual,
+  // which changes CEF_API_HASH and adds surface we would carry forever, to deliver a
+  // value no embedder should ever hold.
+  //
+  // ExecuteOnLocalFrame gives the correct timing for free: the browser sends this at
+  // OnBeforeBrowse, i.e. BEFORE the new document's script context exists, so the action
+  // is queued and drained in OnContextCreated -- ahead of any page JS, and against the
+  // right document rather than the one being navigated away from.
+  if (name == kHodosFarblingKeyMessage) {
+    HandleHodosFarblingKey(arguments);
+    return;
+  }
+
   if (auto app = CefAppManager::Get()->GetApplication()) {
     if (auto handler = app->GetRenderProcessHandler()) {
       CefRefPtr<CefProcessMessageImpl> message(

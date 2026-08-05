@@ -125,6 +125,25 @@ BLINK_EXPORT void StartNavigation(blink::WebLocalFrame* frame,
 // Sets whether select popup menus should be rendered by the browser.
 BLINK_EXPORT void SetUseExternalPopupMenus(blink::WebView* view, bool value);
 
+// Hodos C2: installs this document's fingerprint-farbling material.
+//
+// |key32| is exactly 32 bytes: HMAC-SHA256(profile_seed, first-party eTLD+1),
+// computed in the BROWSER process. The master profile seed never enters a renderer
+// and never appears on any command line, so a compromised renderer learns its own
+// site's key and nothing about any other site. |farbling_enabled| is the browser's
+// single already-collapsed verdict (global toggle AND auth-domain allowlist AND the
+// user's per-site Privacy Shield toggle); the renderer does not re-decide.
+//
+// Lands on the frame's LocalDOMWindow via HodosSessionCache. Until this is called
+// the cache holds no key, so every patched API returns the native value: a missed
+// or late delivery degrades to "not farbled" rather than to a degenerate
+// constant-seeded farble, which would be a worse fingerprint than none.
+//
+// Safe to call on a detached or document-less frame; it no-ops.
+BLINK_EXPORT void SetHodosFarblingKey(blink::WebLocalFrame* frame,
+                                      const uint8_t* key32,
+                                      bool farbling_enabled);
+
 }  // namespace blink_glue
 
 #endif  // CEF_LIBCEF_RENDERER_BLINK_GLUE_H_

@@ -100,6 +100,10 @@ class CefFrameImpl
   // action if the JavaScript context is not yet created.
   using LocalFrameAction =
       base::OnceCallback<void(blink::WebLocalFrame* frame)>;
+  // Hodos C2: decode + install this document's farbling key. Handled inside libcef
+  // because the key must reach Blink, which the client cannot touch.
+  void HandleHodosFarblingKey(const base::ListValue& arguments);
+
   void ExecuteOnLocalFrame(const std::string& function_name,
                            LocalFrameAction action);
 
