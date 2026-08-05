@@ -74,15 +74,29 @@ git_apply_patch_file`), preceded by a reverse-check. So:
 
 | `name` | Feature | Q5 row | Targets | `condition` | Generated against | Last rebase | Last apply reading |
 |---|---|---|---|---|---|---|---|
-| *(none)* | — | — | — | — | — | — | — |
+| `hodos_farble_session_cache` | C1 `HodosSessionCache` Supplement | C1 | `core/execution_context/build.gni` (2-line hunk) + **2 new files** `hodos_session_cache.{h,cc}` | `HODOS_FARBLING` | `94c1726` / Chromium `150.0.7871.187` | — (initial) | `115 patches total (1 applied, 114 skipped, 0 failed)` |
 
-**Empty by design.** `hodos_noop_probe` stood the toolchain up, was proven end to end, and was removed
-per OQ-7 (it would otherwise ship a pointless hunk and inflate the count the drift audit baselines
-against). Registered count is back to the upstream **114**. The `# --- Hodos patches ---` block in
-`patch.cfg` is retained as the landing site for C1–C7.
+Registered count is now **115** (upstream 114 + C1). `hodos_noop_probe` stood the toolchain up, was
+proven end to end, and was removed per OQ-7 before C1 landed.
 
 Standup evidence, for anyone re-verifying the pipeline without re-running it:
 `115 patches total (1 applied, 114 skipped, 0 failed)` on apply, `AUTOMATE_EXIT=0` on the full build.
+
+### C1 — why its rebase cost should stay near zero
+
+C1 deliberately **modifies no existing source file**. It adds two new files and a two-line entry to a
+per-directory source list. Two consequences worth protecting on every future bump:
+
+* The only conflict surface is `core/execution_context/build.gni`. Blink keeps per-directory
+  `build.gni` files rather than one monolithic `core/BUILD.gn` source list, which is a much lower-churn
+  target than the plan originally assumed — prefer it if a future patch needs to add sources here.
+* **No hook was needed in `execution_context.{h,cc}`.** `ExecutionContext` already derives from
+  `Supplementable<ExecutionContext>`, so a Supplement attaches purely from its own translation unit via
+  `ProvideTo`. The plan's "hook `execution_context.{h,cc}`" step was unnecessary; do not re-add it, and
+  do not let a rebase reintroduce a hunk there.
+
+**Keep the perturbation logic in `hodos_session_cache.cc` and the patches on Chromium files as
+one-liners.** A new file never conflicts. That is the entire rebase strategy for C1–C7.
 
 ### ⚠️ Version-string caveat when building from this fork
 
@@ -104,18 +118,36 @@ detach, and `get_branch_name(...).split('/')[-1]` yields `7871`, which is neithe
 so the real MINOR/PATCH are read. Pair it with an assertion that the resolved SHA matches an expected
 value, since a branch tip alone is not a reproducible pin.
 
-**Planned (P4 / FEAT-B1)** — slots defined, not yet authored. All `path` = `src` (Blink lives in the
+**Planned (P4 / FEAT-B1)** — slots defined, not yet authored. (C1 has landed; see the register above.) All `path` = `src` (Blink lives in the
 Chromium tree, not a sub-repo), all `condition: HODOS_FARBLING`:
 
 | `name` | Feature | Notes |
 |---|---|---|
-| `hodos_farble_session_cache` | C1 `HodosSessionCache : Supplement<ExecutionContext>` | **Creates a new file** (diff against `/dev/null`) **and edits a Blink `BUILD.gn`** so it compiles. The `BUILD.gn` hunk is the canary in every rebase — build files churn and rename. |
 | `hodos_farble_seed_wiring` | C2 seed/channel delivery | Browser process computes `domain_key`; the master seed never reaches the renderer. |
 | `hodos_farble_canvas2d` | C3 Canvas 2D | Highest-churn target (`base_rendering_context_2d.cc`) — the riskiest rebase. |
 | `hodos_farble_webgl` | C4 WebGL incl. `readPixels` | |
 | `hodos_farble_webaudio` | C5 WebAudio | |
 | `hodos_farble_navigator` | C6 Navigator | |
 | `hodos_farble_auth_exempt` | C7 auth-domain exemption | |
+
+---
+
+## 2b. ⚠️ The drift audit reads the IN-TREE copy — so it cannot see a patch you just authored
+
+`cef_patch_drift_audit.sh` sets `CEF_SRC=/c/cef/cef150/chromium/src/cef`. That is correct — it audits
+what will actually compile — but it means running the audit right after committing a patch **here**
+(the standalone checkout) reports `Hodos entries : 0` and `AUDIT_RESULT: CLEAN`, which reads exactly
+like success and is actually the audit telling you the in-tree copy is stale (P3 trap #2).
+
+**Correct order, every time:**
+
+1. author + commit the patch in this checkout, and **push** it
+2. bump `CEF_CHECKOUT` in *both* build scripts to the new commit
+3. run `automate-git` — the changed hash is what refreshes `chromium/src/cef`
+4. **now** run the drift audit, and read the `Hodos entries` line
+5. build, and read the patcher's `N patches total` line (114 + your patches)
+
+Skipping straight from 1 to 5 is how you get a green build with zero Hodos patches compiled in.
 
 ---
 

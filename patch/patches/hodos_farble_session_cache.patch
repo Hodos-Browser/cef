@@ -1,0 +1,314 @@
+diff --git third_party/blink/renderer/core/execution_context/build.gni third_party/blink/renderer/core/execution_context/build.gni
+index a158629b41b26..e904c1930ac07 100644
+--- third_party/blink/renderer/core/execution_context/build.gni
++++ third_party/blink/renderer/core/execution_context/build.gni
+@@ -13,6 +13,8 @@ blink_core_sources_execution_context = [
+   "execution_context_lifecycle_observer.h",
+   "execution_context_lifecycle_state_observer.cc",
+   "execution_context_lifecycle_state_observer.h",
++  "hodos_session_cache.cc",
++  "hodos_session_cache.h",
+   "navigator_base.cc",
+   "navigator_base.h",
+   "remote_security_context.cc",
+diff --git third_party/blink/renderer/core/execution_context/hodos_session_cache.cc third_party/blink/renderer/core/execution_context/hodos_session_cache.cc
+new file mode 100644
+index 0000000000000..80da6f5c2a90d
+--- /dev/null
++++ third_party/blink/renderer/core/execution_context/hodos_session_cache.cc
+@@ -0,0 +1,154 @@
++// Copyright 2026 Marston Enterprises. All rights reserved.
++// Use of this source code is governed by a BSD-style license identical to
++// Chromium's; see the Chromium LICENSE file in the root of this tree.
++//
++// Clean-room provenance: see the header.
++
++#include "third_party/blink/renderer/core/execution_context/hodos_session_cache.h"
++
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++
++namespace blink {
++
++namespace {
++
++// splitmix64 (Vigna, public domain). Used only to expand a seed into well-mixed
++// state; xoshiro's authors recommend exactly this for initialization, because
++// seeding the state directly from structured input produces poor early output.
++uint64_t SplitMix64(uint64_t& x) {
++  x += 0x9e3779b97f4a7c15ULL;
++  uint64_t z = x;
++  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
++  z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
++  return z ^ (z >> 31);
++}
++
++inline uint32_t RotL(uint32_t x, int k) {
++  return (x << k) | (x >> (32 - k));
++}
++
++}  // namespace
++
++// ---------------------------------------------------------------------------
++// HodosPrng -- xoshiro128++ (Blackman & Vigna, public domain algorithm).
++//
++// Chosen over std::mt19937 because it is a few instructions per value with no
++// heap state, and PerturbPixels calls it once per pixel on readback paths that
++// sites can invoke in a loop. Statistical quality far exceeds what perturbation
++// needs; the requirement that actually matters is reproducibility.
++// ---------------------------------------------------------------------------
++HodosPrng::HodosPrng(uint64_t seed, uint64_t stream) {
++  // Mixing the stream id into the seed (rather than, say, into the output) means
++  // two streams are independent sequences, not offsets of one sequence.
++  uint64_t x = seed ^ (stream * 0x9e3779b97f4a7c15ULL);
++  uint64_t a = SplitMix64(x);
++  uint64_t b = SplitMix64(x);
++  s_[0] = static_cast<uint32_t>(a);
++  s_[1] = static_cast<uint32_t>(a >> 32);
++  s_[2] = static_cast<uint32_t>(b);
++  s_[3] = static_cast<uint32_t>(b >> 32);
++  // All-zero state is xoshiro's one degenerate case: it would emit zeros forever.
++  // SplitMix64 makes it vanishingly unlikely, but the cost of ruling it out is one
++  // branch on a path that runs once per context.
++  if ((s_[0] | s_[1] | s_[2] | s_[3]) == 0) {
++    s_[0] = 1u;
++  }
++}
++
++uint32_t HodosPrng::Next() {
++  const uint32_t result = RotL(s_[0] + s_[3], 7) + s_[0];
++  const uint32_t t = s_[1] << 9;
++  s_[2] ^= s_[0];
++  s_[3] ^= s_[1];
++  s_[1] ^= s_[2];
++  s_[0] ^= s_[3];
++  s_[2] ^= t;
++  s_[3] = RotL(s_[3], 11);
++  return result;
++}
++
++double HodosPrng::NextDouble() {
++  // 2^-32, so the result lands in [0, 1) with uniform spacing.
++  return static_cast<double>(Next()) * 2.3283064365386963e-10;
++}
++
++// ---------------------------------------------------------------------------
++// HodosSessionCache
++// ---------------------------------------------------------------------------
++
++// static
++const char HodosSessionCache::kSupplementName[] = "HodosSessionCache";
++
++HodosSessionCache::HodosSessionCache(ExecutionContext& context)
++    : Supplement<ExecutionContext>(context) {}
++
++// static
++HodosSessionCache& HodosSessionCache::From(ExecutionContext& context) {
++  HodosSessionCache* cache =
++      Supplement<ExecutionContext>::From<HodosSessionCache>(context);
++  if (!cache) {
++    cache = MakeGarbageCollected<HodosSessionCache>(context);
++    Supplement<ExecutionContext>::ProvideTo(context, cache);
++  }
++  // Deliberately returns a reference: callers are patched hot paths inside Blink
++  // API implementations, and a null check at every one of them is a null check
++  // someone eventually forgets. A key-less cache is already safe -- it reports
++  // FarblingEnabled() == false and every helper degrades to a no-op.
++  return *cache;
++}
++
++void HodosSessionCache::SetOriginKey(const std::array<uint8_t, 32>& domain_key,
++                                     bool farbling_enabled) {
++  domain_key_ = domain_key;
++  farbling_enabled_ = farbling_enabled;
++  has_key_ = true;
++}
++
++uint64_t HodosSessionCache::KeySeed() const {
++  // FNV-1a over the 32 key bytes. The key is already a uniformly distributed
++  // HMAC output, so this only needs to fold it to 64 bits without discarding
++  // material -- taking the first 8 bytes would work too, but folding means a
++  // future change to the key derivation cannot silently reduce our entropy.
++  uint64_t h = 1469598103934665603ULL;
++  for (uint8_t byte : domain_key_) {
++    h ^= byte;
++    h *= 1099511628211ULL;
++  }
++  return h;
++}
++
++HodosPrng HodosSessionCache::MakePrng(Stream stream) const {
++  return HodosPrng(KeySeed(), static_cast<uint64_t>(stream));
++}
++
++void HodosSessionCache::PerturbPixels(uint8_t* pixels,
++                                      size_t length_in_bytes,
++                                      Stream stream) {
++  if (!FarblingEnabled() || !pixels) {
++    return;
++  }
++  HodosPrng prng = MakePrng(stream);
++  // Step by 4 (RGBA) and touch only the red channel's low bit: invisible on screen,
++  // decisive for any hash of the buffer. Matches the outgoing JS behaviour exactly,
++  // including the 3% rate, so an already-enrolled user's fingerprint does not change
++  // underneath them when this replaces the injected script.
++  for (size_t i = 0; i + 3 < length_in_bytes; i += 4) {
++    if (prng.NextDouble() < 0.03) {
++      pixels[i] ^= 1u;
++    }
++  }
++}
++
++double HodosSessionCache::AudioFudgeFactor() {
++  if (!FarblingEnabled()) {
++    return 1.0;
++  }
++  HodosPrng prng = MakePrng(Stream::kAudio);
++  return 1.0 + (prng.NextDouble() - 0.5) * 0.0000004;
++}
++
++void HodosSessionCache::Trace(Visitor* visitor) const {
++  Supplement<ExecutionContext>::Trace(visitor);
++}
++
++}  // namespace blink
+diff --git third_party/blink/renderer/core/execution_context/hodos_session_cache.h third_party/blink/renderer/core/execution_context/hodos_session_cache.h
+new file mode 100644
+index 0000000000000..cac3859c576d3
+--- /dev/null
++++ third_party/blink/renderer/core/execution_context/hodos_session_cache.h
+@@ -0,0 +1,135 @@
++// Copyright 2026 Marston Enterprises. All rights reserved.
++// Use of this source code is governed by a BSD-style license identical to
++// Chromium's; see the Chromium LICENSE file in the root of this tree.
++//
++// CLEAN-ROOM PROVENANCE (Hodos M7): this file is an independent implementation
++// written from a behavioral specification -- development-docs/0.4.0/chromium-rebuild/
++// PLAN_farbling_blink.md sections 3, 4 and 7, CreepJS's observable expectations, and
++// Brave's *published design writeups* on per-eTLD+1 farbling. The Supplement mechanics
++// follow Chromium's own in-tree BSD example, core/context_features/
++// context_feature_settings.{h,cc}. No Brave (MPL-2.0) or Bromite (GPL-3) source was
++// read or adapted. The randomness below is the published public-domain splitmix64 /
++// xoshiro128++ construction by Blackman and Vigna, not anyone's browser code.
++
++#ifndef THIRD_PARTY_BLINK_RENDERER_CORE_EXECUTION_CONTEXT_HODOS_SESSION_CACHE_H_
++#define THIRD_PARTY_BLINK_RENDERER_CORE_EXECUTION_CONTEXT_HODOS_SESSION_CACHE_H_
++
++#include <array>
++#include <cstdint>
++
++#include "third_party/blink/renderer/core/core_export.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/platform/supplementable.h"
++
++namespace blink {
++
++// Deterministic PRNG driving every Hodos perturbation.
++//
++// Deterministic is the whole point, not an implementation detail: a site must read
++// the SAME farbled value every time within one profile+origin, or it breaks (and the
++// instability is itself a fingerprint). So this is seeded purely from the per-origin
++// key plus a caller-supplied stream id -- never from time, entropy, or call order.
++class CORE_EXPORT HodosPrng {
++ public:
++  // `seed` is derived from the origin key; `stream` separates independent uses.
++  HodosPrng(uint64_t seed, uint64_t stream);
++
++  uint32_t Next();
++
++  // Uniform in [0, 1). Used for "perturb this element with probability p" tests.
++  double NextDouble();
++
++ private:
++  uint32_t s_[4];
++};
++
++// HodosSessionCache attaches Hodos's fingerprint-farbling state to an ExecutionContext.
++//
++// WHY A SUPPLEMENT ON ExecutionContext, and not injected JavaScript:
++//   * ExecutionContext is the common base of LocalDOMWindow, the worker global scopes
++//     and worklet scopes, so ONE attachment point covers every context type. The JS
++//     injection it replaces ran from OnContextCreated, which never fires for workers
++//     at all -- a window-vs-worker mismatch that is itself a classic tell.
++//   * Farbling happens at API-CALL time (inside getImageData, readPixels,
++//     getChannelData), so there is no injection-timing race and, crucially, the patched
++//     functions still report "[native code]" from toString(). Restoring that prototype
++//     integrity is a large part of why this migration exists.
++//   * State is per-context and GC-managed: no manual lifetime, no cross-frame leakage.
++//
++// FAIL-CLOSED BY CONSTRUCTION. A freshly created cache has no key, and with no key
++// FarblingEnabled() is false and every caller must fall through to the real Chromium
++// value. There is deliberately no "farble with a zero key" state: a degenerate
++// constant-seeded perturbation would be a *worse* fingerprint than not farbling, and
++// the auth-domain exemption depends on the bypass being a true native pass-through
++// rather than a differently-seeded farble.
++class CORE_EXPORT HodosSessionCache final
++    : public GarbageCollected<HodosSessionCache>,
++      public Supplement<ExecutionContext> {
++ public:
++  static const char kSupplementName[];
++
++  explicit HodosSessionCache(ExecutionContext&);
++
++  // Returns the cache for `context`, creating an empty (key-less, therefore
++  // pass-through) one if this is the first call for that context.
++  static HodosSessionCache& From(ExecutionContext&);
++
++  // Installs the per-origin material delivered by the browser process.
++  //
++  // `domain_key` is HMAC-SHA256(profile_seed, first-party eTLD+1), computed in the
++  // browser: the master profile seed never enters a renderer, and never appears on any
++  // command line. `farbling_enabled` is the browser's single ShouldFarble() verdict for
++  // the whole page -- global toggle AND auth-domain allowlist AND the user's per-site
++  // Privacy Shield toggle, already collapsed. The renderer does not re-decide.
++  void SetOriginKey(const std::array<uint8_t, 32>& domain_key,
++                    bool farbling_enabled);
++
++  // True only when a key has been delivered AND the browser said to farble.
++  // Every patched API must return the native value when this is false.
++  bool FarblingEnabled() const { return has_key_ && farbling_enabled_; }
++
++  // True once the browser has answered for this context at all, whatever the answer.
++  // Distinguishes "exempt" from "not told yet", which is what lets the delivery path
++  // know whether it still owes this context a fetch.
++  bool HasOriginKey() const { return has_key_; }
++
++  // Independent deterministic streams off the same origin key. Give each vector its
++  // own id so canvas noise and audio noise are not the same number sequence -- reusing
++  // one stream across APIs would let a site correlate them and recover the seed.
++  enum class Stream : uint64_t {
++    kCanvas = 1,
++    kWebglReadPixels = 2,
++    kAudio = 3,
++  };
++
++  HodosPrng MakePrng(Stream stream) const;
++
++  // Flips the low bit of the red channel of ~3% of pixels, matching the perturbation
++  // the outgoing JavaScript implementation applied, so fingerprints stay stable across
++  // the migration for users who are already enrolled somewhere.
++  //
++  // `pixels` is RGBA8. No-op when farbling is disabled. The caller owns the decision of
++  // WHICH readbacks to perturb -- in particular the small-canvas gate lives at the call
++  // site, because only the caller knows the surface's dimensions.
++  void PerturbPixels(uint8_t* pixels, size_t length_in_bytes,
++                     Stream stream = Stream::kCanvas);
++
++  // One multiplier per audio buffer, ~1.0 +/- 2e-7: below the audible floor and below
++  // the precision most fingerprinters hash at, but enough to move the hash. Returns
++  // exactly 1.0 when farbling is disabled, so callers may multiply unconditionally.
++  double AudioFudgeFactor();
++
++  void Trace(Visitor*) const override;
++
++ private:
++  // Folds the 32-byte key into the 64 bits the PRNG is seeded from.
++  uint64_t KeySeed() const;
++
++  std::array<uint8_t, 32> domain_key_{};
++  bool has_key_ = false;
++  bool farbling_enabled_ = false;
++};
++
++}  // namespace blink
++
++#endif  // THIRD_PARTY_BLINK_RENDERER_CORE_EXECUTION_CONTEXT_HODOS_SESSION_CACHE_H_
