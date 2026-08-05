@@ -98,6 +98,36 @@ per-directory source list. Two consequences worth protecting on every future bum
 **Keep the perturbation logic in `hodos_session_cache.cc` and the patches on Chromium files as
 one-liners.** A new file never conflicts. That is the entire rebase strategy for C1–C7.
 
+### ✅ Version string — ACCEPTED 2026-08-05 (owner decision, revisited on new facts)
+
+A fork build now reports **`CEF_VERSION "150.0.<N>-7871.<n>+g<sha>+chromium-150.0.7871.187"`** with a
+real `CEF_VERSION_PATCH` — e.g. `150.0.22-7871.3555+g4ed200c`, `PATCH 22`, at C1.
+
+**`PATCH` = upstream's branch-commit count + ours** (17 upstream + 5 Hodos commits = 22 at C1). It
+therefore **drifts ahead of upstream and will eventually collide**: upstream will publish a real
+`150.0.22`, after which two materially different binaries report the same version, distinguishable
+only by the `-7871.<n>+g<sha>` suffix. **This is accepted.** Mitigation is provenance, not the version
+number: `CEF_COMMIT_HASH` is written into the same header and identifies the fork commit — and hence
+its upstream ancestor — unambiguously. Keep the fork-commit → upstream-base mapping in §2 current.
+
+**Why the earlier "keep `150.0.0-HEAD`" decision no longer applies.** That reading was an *artifact of
+pinning an intermediate commit*, not a property of the fork. `git_util.get_branch_name()` falls back on
+a detached HEAD to `git log -1 --pretty=%d` and takes the **last** decoration; at `0a709e584` (a
+mid-history commit) there was none, so it returned `"HEAD"` and `cef_version.py` zeroed MINOR/PATCH. At
+`4ed200cf9` the decoration reads `(HEAD, origin/hodos/7871, hodos/7871)` → `"hodos/7871"` →
+`.split('/')[-1]` → `"7871"` → real MINOR/PATCH. **Every future landing pins the commit you just
+pushed, which is by definition the branch tip**, so `150.0.0-HEAD` is not reproducible going forward
+and nothing needs undoing to get it back.
+
+Note the **security-relevant field is present either way**: `chromium-150.0.7871.187` carries the CVE
+content; CEF's `150.0.x` counter tracks CEF's own commits.
+
+⚠️ **Consequence to track:** distribution directory and tarball names now embed this version
+(`cef_binary_150.0.22-7871.3555+g4ed200c+..._windows64*`). Anything matching those by name — the
+`cef-binaries/` staging step, the CI asset — must not assume a fixed string.
+
+<details><summary>Historical: the original caveat, kept for the record</summary>
+
 ### ⚠️ Version-string caveat when building from this fork
 
 A fork build reports `CEF_VERSION "150.0.0-HEAD.<n>+g<sha>+chromium-150.0.7871.187"` with
@@ -117,6 +147,8 @@ belongs in the table above.
 detach, and `get_branch_name(...).split('/')[-1]` yields `7871`, which is neither `master` nor `HEAD`,
 so the real MINOR/PATCH are read. Pair it with an assertion that the resolved SHA matches an expected
 value, since a branch tip alone is not a reproducible pin.
+
+</details>
 
 **Planned (P4 / FEAT-B1)** — slots defined, not yet authored. (C1 has landed; see the register above.) All `path` = `src` (Blink lives in the
 Chromium tree, not a sub-repo), all `condition: HODOS_FARBLING`:
