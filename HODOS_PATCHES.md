@@ -74,7 +74,35 @@ git_apply_patch_file`), preceded by a reverse-check. So:
 
 | `name` | Feature | Q5 row | Targets | `condition` | Generated against | Last rebase | Last apply reading |
 |---|---|---|---|---|---|---|---|
-| `hodos_noop_probe` | P3 standup smoke — **scaffolding, remove after standup (OQ-7)** | CEF-1 | `AUTHORS` | `HODOS_FARBLING` | upstream `7871` @ `94c1726` | n/a (initial) | clean, no offsets |
+| *(none)* | — | — | — | — | — | — | — |
+
+**Empty by design.** `hodos_noop_probe` stood the toolchain up, was proven end to end, and was removed
+per OQ-7 (it would otherwise ship a pointless hunk and inflate the count the drift audit baselines
+against). Registered count is back to the upstream **114**. The `# --- Hodos patches ---` block in
+`patch.cfg` is retained as the landing site for C1–C7.
+
+Standup evidence, for anyone re-verifying the pipeline without re-running it:
+`115 patches total (1 applied, 114 skipped, 0 failed)` on apply, `AUTOMATE_EXIT=0` on the full build.
+
+### ⚠️ Version-string caveat when building from this fork
+
+A fork build reports `CEF_VERSION "150.0.0-HEAD.<n>+g<sha>+chromium-150.0.7871.187"` with
+**`CEF_VERSION_PATCH 0`**, not upstream's `150.0.17` / `PATCH 17`.
+
+`cef/tools/cef_version.py:189-225`: our patch commits are **descendants** of branch `7871`, so
+`is_ancestor(HEAD, '7871')` is false — any fork adding commits on top of a release branch fails that
+test by construction — and because `automate-git` checks out a SHA, the branch name is `"HEAD"`, which
+takes the arm that zeroes MINOR/PATCH.
+
+**Consequence:** a fork-built binary does not say which upstream security point-release it contains,
+which undercuts the standing security-pull duty in §4. Until resolved, **`CEF_COMMIT_HASH` in the
+produced header is the authoritative build identifier**, and the fork-commit → upstream-version mapping
+belongs in the table above.
+
+**Likely fix** (`:213-216`): pass `--checkout=hodos/7871` — a *branch*, so `git checkout` does not
+detach, and `get_branch_name(...).split('/')[-1]` yields `7871`, which is neither `master` nor `HEAD`,
+so the real MINOR/PATCH are read. Pair it with an assertion that the resolved SHA matches an expected
+value, since a branch tip alone is not a reproducible pin.
 
 **Planned (P4 / FEAT-B1)** — slots defined, not yet authored. All `path` = `src` (Blink lives in the
 Chromium tree, not a sub-repo), all `condition: HODOS_FARBLING`:
@@ -135,6 +163,13 @@ reproducible.
 5. Register in `patch.cfg` per §1, with `'condition': 'HODOS_FARBLING'` and a `'note'`.
 6. Run the drift audit (`cef_patch_drift_audit.sh` in the Hodos app repo). Expect `0 failed`, no offsets.
 7. Update §2 above.
+
+> **⚠️ `automate-git` leaves this checkout on a DETACHED HEAD** (it does `git checkout <rev>`). A commit
+> made here therefore lands off-branch, and `git push origin hodos/7871` then reports
+> **"Everything up-to-date"** while silently pushing nothing — you will believe your patch is on the fork
+> when it is not. Check `git rev-parse --abbrev-ref HEAD` first; if it prints `HEAD`, run
+> `git branch -f hodos/7871 <sha>` (or `git checkout hodos/7871` before committing). Hit for real during
+> P3 standup.
 
 **Never** use `patch_updater.py --reapply` / `--restore` as a validation step: it has no dry-run mode
 and is write-capable — it *resaves* the `.patch` files it is supposed to be checking. Validate with
