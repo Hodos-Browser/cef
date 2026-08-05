@@ -40,6 +40,22 @@ It is **not** `run_patch_updater` — on a pinned checkout (`--checkout=<rev>` w
 compat version) that function never applies anything. Practical upshot: **`--force-build` alone
 re-applies patches**; no re-sync needed to iterate.
 
+> ### ⚠️ The in-tree CEF dir is a COPY, and a stale one loses your patches silently
+>
+> `patcher.py` runs from `<chromium>/src/cef`, which `automate-git.py` **copies** from the standalone
+> checkout — but only when the CEF checkout **hash changes** (`:1358-1360`; delete at `:1535-1539`,
+> re-copy at `:1597-1599`). If the standalone dir is **already at** the target commit — because someone
+> `git checkout`ed or `git pull`ed it by hand before building — then `cef_checkout_changed` is **False**
+> and neither step runs. **The build then uses whatever stale patch set the in-tree copy holds. You can
+> have the right fork, the right pin, a green automate-git run, and zero Hodos patches compiled in.**
+>
+> **Detect** with the patcher's own count in the build log, and the drift audit's `Hodos entries` line.
+> **Fix** with `--force-cef-update`, or delete `<chromium>/src/cef` and let the re-copy fire.
+>
+> The normal flow self-corrects (land a patch → bump `--checkout` → hashes differ → refresh). The trap
+> needs manual intervention in the standalone checkout, which is exactly what someone debugging a patch
+> problem does first. Measured 2026-08-05.
+
 **How they are applied** — `git apply -p0 --ignore-whitespace` (`tools/git_util.py ::
 git_apply_patch_file`), preceded by a reverse-check. So:
 - **`-p0`**: patch paths carry **no `a/` `b/` prefixes** and are rooted at the tree root. Author with
