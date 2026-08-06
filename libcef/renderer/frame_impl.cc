@@ -460,14 +460,16 @@ void CefFrameImpl::OnDetached() {
 void CefFrameImpl::HandleHodosFarblingKey(const base::ListValue& arguments) {
   // Payload: [0] = 64 lowercase hex chars (the 32-byte per-origin key),
   //          [1] = bool, the browser's already-collapsed ShouldFarble verdict.
-  const auto& list = arguments.GetList();
-  if (list.size() < 2 || !list[0].is_string() || !list[1].is_bool()) {
+  // base::ListValue in CEF 150 is a plain container (size/operator[]), not the
+  // old class with GetList().
+  if (arguments.size() < 2 || !arguments[0].is_string() ||
+      !arguments[1].is_bool()) {
     LOG(WARNING) << "Hodos: malformed farbling key payload; not farbling "
                  << frame_debug_str_;
     return;
   }
 
-  const std::string& hex = list[0].GetString();
+  const std::string& hex = arguments[0].GetString();
   std::array<uint8_t, 32> key{};
   if (hex.size() != key.size() * 2) {
     LOG(WARNING) << "Hodos: farbling key wrong length; not farbling "
@@ -486,7 +488,7 @@ void CefFrameImpl::HandleHodosFarblingKey(const base::ListValue& arguments) {
     key[i] = static_cast<uint8_t>(byte);
   }
 
-  const bool enabled = list[1].GetBool();
+  const bool enabled = arguments[1].GetBool();
   ExecuteOnLocalFrame(
       __FUNCTION__,
       base::BindOnce(
