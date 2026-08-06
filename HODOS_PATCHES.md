@@ -49,12 +49,19 @@ re-applies patches**; no re-sync needed to iterate.
 > and neither step runs. **The build then uses whatever stale patch set the in-tree copy holds. You can
 > have the right fork, the right pin, a green automate-git run, and zero Hodos patches compiled in.**
 >
-> **Detect** with the patcher's own count in the build log, and the drift audit's `Hodos entries` line.
+> **Detect** with the drift audit's `hodos_*.patch files` / `hodos_* patch.cfg entries` presence gate,
+> cross-checked against the patcher's own count in the build log.
 > **Fix** with `--force-cef-update`, or delete `<chromium>/src/cef` and let the re-copy fire.
 >
-> The normal flow self-corrects (land a patch → bump `--checkout` → hashes differ → refresh). The trap
-> needs manual intervention in the standalone checkout, which is exactly what someone debugging a patch
-> problem does first. Measured 2026-08-05.
+> ⛔ **CORRECTED 2026-08-05 — this is the DEFAULT outcome, not an edge case.** An earlier version of
+> this note claimed "the normal flow self-corrects (land a patch → bump `--checkout` → hashes differ →
+> refresh)". **That is wrong and it cost a build.** `cef_current_hash` is read from the **standalone
+> checkout's HEAD** (`automate-git.py:1351`), and landing a patch *requires* committing there — which
+> moves HEAD to exactly the SHA you then pin. So `current == desired` and the copy is **never**
+> refreshed. It self-corrects only if you never commit locally, which is not a real workflow.
+> Measured landing C1: `114 patches total` (zero Hodos patches, fully green run) → with
+> `--force-cef-update`, `115 patches total (1 applied, 114 skipped, 0 failed)`.
+> **Both build scripts now pass `--force-cef-update` unconditionally. Do not remove it.**
 
 **How they are applied** — `git apply -p0 --ignore-whitespace` (`tools/git_util.py ::
 git_apply_patch_file`), preceded by a reverse-check. So:
@@ -176,8 +183,19 @@ like success and is actually the audit telling you the in-tree copy is stale (P3
 1. author + commit the patch in this checkout, and **push** it
 2. bump `CEF_CHECKOUT` in *both* build scripts to the new commit
 3. run `automate-git` — the changed hash is what refreshes `chromium/src/cef`
-4. **now** run the drift audit, and read the `Hodos entries` line
-5. build, and read the patcher's `N patches total` line (114 + your patches)
+4. **now** run the drift audit, and read its **presence gate** — the `hodos_*.patch files` /
+   `hodos_* patch.cfg entries` lines (floor: `HODOS_MIN_PATCHES`, default 1)
+5. build, and cross-check the patcher's `N patches total` line
+
+> **Gate on PRESENCE, never on a TOTAL.** "Must equal 114 upstream + our patches" was the old wording
+> and it is the wrong invariant: the expected number changes on every landing, so the gate needs
+> hand-editing each time — and a gate that must be hand-updated is one that eventually gets updated
+> wrongly. `hodos_*.patch` presence is invariant. The patcher's total stays useful as a cross-check and
+> as the cheapest stale-copy tell in a raw build log, but it is not the gate.
+> (Mac raised this on 2026-08-06 and it was adopted; the arithmetic itself was fine — upstream `94c1726`
+> has **114** registered entries, and `grep -c "'name'" patch/patch.cfg` over-counts to 116 because
+> `patch.cfg`'s header comment documents the format and contains the literal `'name'` on line 7. Use
+> `grep -c "^\s*'name'"`, or better, let the audit `exec` the file the way `patcher.py` does.)
 
 Skipping straight from 1 to 5 is how you get a green build with zero Hodos patches compiled in.
 
@@ -213,6 +231,28 @@ reproducible.
 
 ## 5. Authoring a new patch
 
+> ### ⛔ A change to `cef/libcef/**` is NOT verified by a `cef-native` build
+>
+> **The Hodos shell build does not compile `libcef`.** `cef-native` links against the *prebuilt*
+> `libcef.dll` / `Chromium Embedded Framework.framework` staged in `cef-binaries/`. So a green
+> `cmake --build cef-native/build` tells you **nothing** about any edit under `cef/libcef/` — not
+> whether it compiles, not whether it links, not whether it does anything.
+>
+> **The only thing that verifies fork code is a CEF build.** That is the 4–5 h path, not the 5 min one.
+>
+> This cost **two build cycles** landing C2 (2026-08-06). Both defects were compile-only and both were
+> in fork code, so both were invisible to the shell build that had been used to declare the step
+> "builds clean":
+> * `LOG(WARNING)` inside `blink_glue.cc` — within `third_party/blink`, `LOG(channel)` is **WTF's**
+>   macro taking a `WTFLogChannel` object, so `WARNING` is looked up as an identifier and
+>   `base/logging.h` is irrelevant. **Do not reach for `LOG()` in CEF code compiled inside Blink.**
+> * `base::ListValue` on CEF 150 has no `GetList()`.
+>
+> **Rule of thumb:** if the diff touches `cef/libcef/**`, `cef/patch/**` or anything else in this fork,
+> "it builds" is only true after `--force-build` has run to completion. Say "compiled + wired,
+> behaviourally unverified" rather than "builds clean" until then — and prefer a *behavioural* probe
+> over a logging probe, since the logging one may not even compile.
+
 1. `gclient sync` a clean checkout **via this fork**, so earlier Hodos patches are already applied.
 2. **Verify the target file is byte-identical to its index blob** before editing —
    `git hash-object <file>` vs `git ls-files -s <file>`. **Do not trust `git status`**: a file checked
@@ -233,7 +273,20 @@ reproducible.
 > **"Everything up-to-date"** while silently pushing nothing — you will believe your patch is on the fork
 > when it is not. Check `git rev-parse --abbrev-ref HEAD` first; if it prints `HEAD`, run
 > `git branch -f hodos/7871 <sha>` (or `git checkout hodos/7871` before committing). Hit for real during
-> P3 standup.
+> P3 standup — **and again, undetected, across the whole C2 sequence.**
+>
+> **2026-08-06:** found `hodos/7871` (local *and* `origin/hodos/7871`) still at `7749aa3b6` while the
+> working checkout was detached at `b911770b0`. **Three commits — `371893b70`, `e9f3fee65`,
+> `b911770b0` — existed only in the local checkout and had never reached the fork**, even though both
+> build scripts pinned `b911770b0` and the Windows→Mac relay had handed Mac that same pin. The fork
+> remote still carried the temporary C2 probe. A fresh clone (i.e. Mac) could not have resolved the
+> pin at all. Recovered by `git branch -f hodos/7871 b911770b0 && git checkout hodos/7871` — a clean
+> fast-forward, `7749aa3b6` being an ancestor.
+>
+> **This is why the check belongs in the workflow, not in your memory:** the failure is *silent in both
+> directions* — the local build keeps working (it reads the local checkout), and the push reports
+> success. Nothing surfaces it until someone else tries to build the pin. **After every commit here,
+> run `git log --oneline origin/hodos/7871..hodos/7871` and confirm it is empty after pushing.**
 
 **Never** use `patch_updater.py --reapply` / `--restore` as a validation step: it has no dry-run mode
 and is write-capable — it *resaves* the `.patch` files it is supposed to be checking. Validate with
