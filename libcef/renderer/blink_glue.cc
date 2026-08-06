@@ -8,8 +8,6 @@
 #include <algorithm>
 #include <array>
 
-#include "base/logging.h"
-#include "base/strings/stringprintf.h"
 
 #include "third_party/blink/public/mojom/v8_cache_options.mojom-blink.h"
 #include "third_party/blink/public/platform/web_string.h"
@@ -356,18 +354,6 @@ void SetHodosFarblingKey(blink::WebLocalFrame* frame,
   std::array<uint8_t, 32> key{};
   std::copy(key32, key32 + key.size(), key.begin());
   blink::HodosSessionCache::From(*window).SetOriginKey(key, farbling_enabled);
-
-  // ⚠️ TEMPORARY C2 VERIFICATION PROBE -- REMOVE IN C3.
-  //
-  // Until C3 wires canvas, nothing READS the key, so there is no observable
-  // behaviour to test and "C2 works" would otherwise mean only "C2 links". This
-  // is the one signal that the key actually reached Blink on the right document.
-  // WARNING severity because release builds drop INFO. Logs the key's first 4
-  // bytes only -- enough to confirm it differs per origin and is stable per
-  // profile, without writing usable key material to disk.
-  LOG(WARNING) << "HODOS_C2_PROBE origin=" << window->GetSecurityOrigin()->ToString().Utf8()
-               << " enabled=" << (farbling_enabled ? 1 : 0) << " key4="
-               << base::StringPrintf("%02x%02x%02x%02x", key[0], key[1], key[2], key[3]);
 }
 
 }  // namespace blink_glue
