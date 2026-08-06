@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 
+#include "base/logging.h"
 #include "base/strings/stringprintf.h"
 
 #include "third_party/blink/public/mojom/v8_cache_options.mojom-blink.h"
