@@ -82,9 +82,31 @@ git_apply_patch_file`), preceded by a reverse-check. So:
 | `name` | Feature | Q5 row | Targets | `condition` | Generated against | Last rebase | Last apply reading |
 |---|---|---|---|---|---|---|---|
 | `hodos_farble_session_cache` | C1 `HodosSessionCache` Supplement | C1 | `core/execution_context/build.gni` (2-line hunk) + **2 new files** `hodos_session_cache.{h,cc}` | `HODOS_FARBLING` | `94c1726` / Chromium `150.0.7871.187` | — (initial) | `115 patches total (1 applied, 114 skipped, 0 failed)` |
+| `hodos_farble_canvas2d` | C3 Canvas 2D readback farbling | C3 | `modules/canvas/canvas2d/base_rendering_context_2d.cc` (`getImageDataInternal`) + `core/html/canvas/html_canvas_element.cc` (helper + the 2 encode callers of `Snapshot`) | `HODOS_FARBLING` | `94c1726` / Chromium `150.0.7871.187` | — (initial) | ⏳ owed — needs a CEF build |
 
-Registered count is now **115** (upstream 114 + C1). `hodos_noop_probe` stood the toolchain up, was
-proven end to end, and was removed per OQ-7 before C1 landed.
+Registered count is now **116** (upstream 114 + C1 + C3). `hodos_noop_probe` stood the toolchain up,
+was proven end to end, and was removed per OQ-7 before C1 landed.
+
+> ⚠️ **Do not turn that number into a gate.** It is a ledger entry, not an assertion — see §2b. The
+> gate is `hodos_*.patch` presence plus the standalone↔in-tree comparison, both of which are invariant
+> under landings.
+
+### C3 — the two things a rebase must not "simplify"
+
+1. **The farbled snapshot is a COPY, and that is correctness, not hygiene.** `PerturbPixels` is
+   deterministic, so perturbing the canvas's own backing store means the next read re-flips the same
+   bits and *undoes* the farble. The JS implementation this replaced did exactly that (its
+   `toDataURL` override farbled via a `getImageData` → `putImageData` round-trip). If a rebase ever
+   makes `HodosFarbleSnapshot` mutate in place to "avoid a copy", intra-session consistency breaks
+   silently — the probe's `toDataURL stable across reads` assertion is what catches it.
+2. **Hook the two ENCODE callers, never `Snapshot()` itself.** `Snapshot` has a third caller that is
+   not a fingerprinting readback.
+
+Also note C3 reads back into **unpremultiplied RGBA8888**: RGBA so "low bit of byte 0" really is the
+red channel whatever the source order is (and so a float-storage HDR canvas is converted rather than
+reinterpreted as bytes), unpremultiplied because that is what the encoders want, what
+`ImageDataBuffer` converts to anyway for accelerated canvases, and what keeps a perturbation from
+producing an invalid premultiplied pixel with red > alpha.
 
 Standup evidence, for anyone re-verifying the pipeline without re-running it:
 `115 patches total (1 applied, 114 skipped, 0 failed)` on apply, `AUTOMATE_EXIT=0` on the full build.
