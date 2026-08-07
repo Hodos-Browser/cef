@@ -140,7 +140,14 @@ BLINK_EXPORT void SetUseExternalPopupMenus(blink::WebView* view, bool value);
 // constant-seeded farble, which would be a worse fingerprint than none.
 //
 // Safe to call on a detached or document-less frame; it no-ops.
-BLINK_EXPORT void SetHodosFarblingKey(blink::WebLocalFrame* frame,
+//
+// Returns what HodosSessionCache::FarblingEnabled() reports on the target
+// ExecutionContext IMMEDIATELY AFTER the write -- a read-back, not an echo of the
+// argument. So false means one of: no frame, no LocalDOMWindow, or the Supplement
+// did not take the key. This exists because the caller cannot log from inside
+// Blink (LOG(channel) there is WTF's macro taking a WTFLogChannel, not Chromium's),
+// so returning the observed state is how this layer reports outward.
+BLINK_EXPORT bool SetHodosFarblingKey(blink::WebLocalFrame* frame,
                                       const uint8_t* key32,
                                       bool farbling_enabled);
 

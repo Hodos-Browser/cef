@@ -330,30 +330,35 @@ void SetUseExternalPopupMenus(blink::WebView* view, bool value) {
       .SetUseExternalPopupMenus(value);
 }
 
-void SetHodosFarblingKey(blink::WebLocalFrame* frame,
+bool SetHodosFarblingKey(blink::WebLocalFrame* frame,
                          const uint8_t* key32,
                          bool farbling_enabled) {
   if (!frame || !key32) {
-    return;
+    return false;
   }
   auto* web_frame_impl = blink::To<blink::WebLocalFrameImpl>(frame);
   if (!web_frame_impl) {
-    return;
+    return false;
   }
   blink::LocalFrame* local_frame = web_frame_impl->GetFrame();
   if (!local_frame) {
-    return;
+    return false;
   }
   // Detached or not-yet-initialised frames have no window; there is nothing to
   // attach a Supplement to and no document that could read a farbled value.
   blink::LocalDOMWindow* window = local_frame->DomWindow();
   if (!window) {
-    return;
+    return false;
   }
 
   std::array<uint8_t, 32> key{};
   std::copy(key32, key32 + key.size(), key.begin());
-  blink::HodosSessionCache::From(*window).SetOriginKey(key, farbling_enabled);
+  blink::HodosSessionCache& cache = blink::HodosSessionCache::From(*window);
+  cache.SetOriginKey(key, farbling_enabled);
+  // Read back rather than echoing the argument: this is the only signal the
+  // caller gets about whether the Supplement on THIS ExecutionContext actually
+  // holds the key, and it is deliberately observed rather than assumed.
+  return cache.FarblingEnabled();
 }
 
 }  // namespace blink_glue
