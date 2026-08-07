@@ -419,17 +419,9 @@ void CefFrameImpl::OnContextCreated(v8::Local<v8::Context> context) {
   // exists. Consume it, so a later context that gets no message of its own does
   // not inherit this document's key (fail-closed: no key means no farbling).
   if (pending_farble_key_) {
-    const bool observed = blink_glue::SetHodosFarblingKey(
-        frame_, pending_farble_key_->key.data(), pending_farble_key_->enabled);
-    // TEMP DIAGNOSTIC (farbling bring-up) -- remove once the probe is green.
-    LOG(WARNING) << "[FARBLE-DIAG] APPLY-AT-CONTEXT readback_enabled=" << observed
-                 << " url=" << GURL(frame_->GetDocument().Url()).spec()
-                 << " " << frame_debug_str_;
+    blink_glue::SetHodosFarblingKey(frame_, pending_farble_key_->key.data(),
+                                    pending_farble_key_->enabled);
     pending_farble_key_.reset();
-  } else {
-    LOG(WARNING) << "[FARBLE-DIAG] CONTEXT-CREATED with NO pending key url="
-                 << GURL(frame_->GetDocument().Url()).spec()
-                 << " " << frame_debug_str_;
   }
 
   while (!queued_context_actions_.empty()) {
@@ -521,25 +513,13 @@ void CefFrameImpl::HandleHodosFarblingKey(const base::ListValue& arguments) {
   // nothing.
   pending_farble_key_ = PendingFarbleKey{key, enabled};
 
-  // TEMP DIAGNOSTIC (farbling bring-up) -- remove once the probe is green.
-  LOG(WARNING) << "[FARBLE-DIAG] RECV enabled=" << enabled
-               << " keyPrefix=" << hex.substr(0, 16)
-               << " context_created=" << context_created_
-               << " url="
-               << (frame_ ? GURL(frame_->GetDocument().Url()).spec()
-                          : std::string("<no frame>"))
-               << " " << frame_debug_str_;
-
   // Belt and braces for a message that arrives AFTER its own document already
   // committed: apply to the current document too. When the message is pre-commit
   // (the normal case) this writes to a document that is being replaced, which is
   // harmless -- and a cancelled navigation is covered by pending_farble_key_
   // being overwritten before any context is created.
   if (context_created_ && frame_) {
-    const bool observed =
-        blink_glue::SetHodosFarblingKey(frame_, key.data(), enabled);
-    LOG(WARNING) << "[FARBLE-DIAG] APPLY-NOW readback_enabled=" << observed
-                 << " " << frame_debug_str_;
+    blink_glue::SetHodosFarblingKey(frame_, key.data(), enabled);
   }
 }
 
