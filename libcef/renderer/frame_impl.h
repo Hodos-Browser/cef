@@ -102,9 +102,12 @@ class CefFrameImpl
   // action if the JavaScript context is not yet created.
   using LocalFrameAction =
       base::OnceCallback<void(blink::WebLocalFrame* frame)>;
-  // Hodos C2: decode + install this document's farbling key. Handled inside libcef
-  // because the key must reach Blink, which the client cannot touch.
-  void HandleHodosFarblingKey(const base::ListValue& arguments);
+
+  // Hodos C2: PULL this document's farbling key from the browser and install it
+  // into Blink. Called from OnContextCreated -- the only moment that is both after
+  // the right document exists and before any page script runs. Handled inside
+  // libcef because the key must reach Blink, which the client cannot touch.
+  void MaybeApplyHodosFarblingKey();
 
   void ExecuteOnLocalFrame(const std::string& function_name,
                            LocalFrameAction action);
@@ -184,33 +187,21 @@ class CefFrameImpl
   bool context_created_ = false;
   std::queue<std::pair<std::string, LocalFrameAction>> queued_context_actions_;
 
-  // Hodos C2: the per-origin farbling key for the document this frame is about to
-  // create.
+  // Hodos C2: there is deliberately NO cached key member here.
   //
-  // This deliberately does NOT ride queued_context_actions_. That queue is only
-  // used while `context_created_` is false, and `context_created_` is set once in
-  // OnContextCreated and NEVER reset -- so from the frame's second document
-  // onward ExecuteOnLocalFrame runs the action IMMEDIATELY, and because the
-  // browser sends the key PRE-COMMIT, "immediately" means against the OUTGOING
-  // document's LocalDOMWindow. The incoming document then gets a key-less cache
-  // and farbles nothing.
+  // A per-frame cache cannot work, and this is proven rather than suspected: frame
+  // tokens change per document and frame_debug_str_ is built in the constructor, so
+  // each document gets a NEW CefFrameImpl. Anything parked on this object is
+  // invisible to the next document. Combined with the browser sending pre-commit,
+  // a pushed key always landed on the OUTGOING document and the incoming one
+  // farbled nothing -- everything compiled, everything was wired, and canvas
+  // farbling silently did not happen. Found 2026-08-07 by the behavioural half of
+  // farbling_probe.py: every [native code] assertion passed while the farbled
+  // page's canvas was byte-identical to the exempt page's.
   //
-  // That was a live bug, not a hypothetical: everything compiled, everything was
-  // wired, and canvas farbling silently did not happen. Found 2026-08-07 by the
-  // behavioural half of farbling_probe.py -- every [native code] assertion passed
-  // while the farbled page's canvas was byte-identical to the exempt page's.
-  //
-  // Consume-once, and overwritten by each new message:
-  //   * overwrite-on-arrival makes a CANCELLED navigation safe, because the next
-  //     navigation's key replaces the stale one before any context is created;
-  //   * consume-once stops a later context that received no message of its own
-  //     (about:blank) from inheriting an earlier document's key -- it gets
-  //     nothing, which is fail-closed per C1's no-key-means-no-farbling contract.
-  struct PendingFarbleKey {
-    std::array<uint8_t, 32> key;
-    bool enabled;
-  };
-  std::optional<PendingFarbleKey> pending_farble_key_;
+  // The key is therefore PULLED per document in MaybeApplyHodosFarblingKey(), from
+  // browser-process state that outlives any single document or renderer process.
+  // Do not reintroduce a member cache here.
 
   bool attach_denied_ = false;
 

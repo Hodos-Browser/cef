@@ -160,6 +160,18 @@ class CefFrameHostImpl : public CefFrame, public cef::mojom::BrowserFrame {
   void UpdateDraggableRegions(
       std::optional<std::vector<cef::mojom::DraggableRegionEntryPtr>> regions)
       override;
+  // Hodos: required because this class ALSO implements cef::mojom::BrowserFrame,
+  // so adding a method to that interface obligates both implementors.
+  //
+  // Unlike its siblings above this one is NOT forwarded from CefBrowserFrame --
+  // CefBrowserFrame answers the pull itself, deliberately, so it can reply without
+  // resolving a CefFrameHostImpl (which may be absent or speculative mid-navigation,
+  // which is exactly when the renderer is blocked waiting). Implemented here anyway
+  // rather than NOTREACHED()'d: it is a few lines, it cannot crash, and a privacy
+  // path should not carry a landmine.
+  void GetHodosFarblingKey(
+      const std::string& host,
+      cef::mojom::BrowserFrame::GetHodosFarblingKeyCallback callback) override;
 
   bool is_temporary() const { return !frame_token_.has_value(); }
   std::optional<content::GlobalRenderFrameHostToken> frame_token() const {

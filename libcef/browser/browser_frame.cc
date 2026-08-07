@@ -6,6 +6,7 @@
 
 #include "cef/libcef/browser/browser_host_base.h"
 #include "cef/libcef/browser/browser_info_manager.h"
+#include "cef/libcef/browser/hodos_farbling_registry.h"
 #include "cef/libcef/browser/thread_util.h"
 #include "cef/libcef/common/frame_util.h"
 #include "content/public/browser/render_frame_host.h"
@@ -46,6 +47,23 @@ void CefBrowserFrame::SendMessage(const std::string& name,
   if (auto host = GetFrameHost(/*prefer_speculative=*/true)) {
     host->SendMessage(name, std::move(arguments));
   }
+}
+
+void CefBrowserFrame::GetHodosFarblingKey(
+    const std::string& host,
+    cef::mojom::BrowserFrame::GetHodosFarblingKeyCallback callback) {
+  std::string key_hex;
+  bool enabled = false;
+  if (!hodos::FarblingRegistry::GetInstance().Lookup(host, &key_hex,
+                                                     &enabled)) {
+    // Nothing filed for this host. Reply with an empty key rather than dropping
+    // the callback: the renderer is blocked on this sync call, and it needs a
+    // definite "no key" to fail closed on. Never invent a key here -- a constant
+    // or zero key is a WORSE fingerprint than not farbling at all.
+    std::move(callback).Run(std::string(), false);
+    return;
+  }
+  std::move(callback).Run(key_hex, enabled);
 }
 
 void CefBrowserFrame::SendSharedMemoryRegion(

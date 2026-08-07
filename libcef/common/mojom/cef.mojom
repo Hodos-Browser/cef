@@ -98,6 +98,27 @@ interface BrowserFrame {
 
   // Draggable regions have updated.
   UpdateDraggableRegions(array<DraggableRegionEntry>? regions);
+
+  // Hodos: retrieve this document's fingerprint-farbling material.
+  //
+  // FORK-INTERNAL. Not reachable from the public CEF API and not part of any
+  // CEF_API_HASH surface -- the key must land inside Blink, which an embedder
+  // cannot touch, and no embedder should ever hold this value.
+  //
+  // |host| is the committed document's host. The browser reduces it to the
+  // registrable domain the key was filed under and returns that entry, or an
+  // empty |key_hex| when it has nothing for that host (fail closed: the renderer
+  // then farbles nothing and returns native values).
+  //
+  // ⚠️ [Sync] IS LOAD-BEARING, not a convenience. The renderer must hold the key
+  // before the first page script runs, and the only moment that is both after the
+  // right document exists and before script runs is OnContextCreated. Neither push
+  // direction works: an async push queues in SendToBrowserFrame until the
+  // FrameAttached ack round-trip completes, which is strictly after
+  // OnContextCreated, so it loses the race against an inline script; and a
+  // pre-commit push lands on the OUTGOING document entirely. See frame_impl.cc.
+  [Sync]
+  GetHodosFarblingKey(string host) => (string key_hex, bool enabled);
 };
 
 struct CrossOriginWhiteListEntry {

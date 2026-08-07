@@ -413,16 +413,9 @@ void CefFrameImpl::OnContextCreated(v8::Local<v8::Context> context) {
 
   CHECK(frame_);
 
-  // Hodos C2: install the farbling key on THIS document before any page script
-  // runs. Doing it here is the whole point -- the browser delivers the key
-  // pre-commit, so this is the first moment the LocalDOMWindow it belongs to
-  // exists. Consume it, so a later context that gets no message of its own does
-  // not inherit this document's key (fail-closed: no key means no farbling).
-  if (pending_farble_key_) {
-    blink_glue::SetHodosFarblingKey(frame_, pending_farble_key_->key.data(),
-                                    pending_farble_key_->enabled);
-    pending_farble_key_.reset();
-  }
+  // Hodos C2: install this document's farbling key before any page script runs.
+  // This is a PULL, and it has to be -- see MaybeApplyHodosFarblingKey().
+  MaybeApplyHodosFarblingKey();
 
   while (!queued_context_actions_.empty()) {
     auto& action = queued_context_actions_.front();
@@ -469,28 +462,102 @@ void CefFrameImpl::OnDetached() {
   }
 }
 
-void CefFrameImpl::HandleHodosFarblingKey(const base::ListValue& arguments) {
-  // Payload: [0] = 64 lowercase hex chars (the 32-byte per-origin key),
-  //          [1] = bool, the browser's already-collapsed ShouldFarble verdict.
-  // base::ListValue in CEF 150 is a plain container (size/operator[]), not the
-  // old class with GetList().
-  if (arguments.size() < 2 || !arguments[0].is_string() ||
-      !arguments[1].is_bool()) {
-    LOG(WARNING) << "Hodos: malformed farbling key payload; not farbling "
-                 << frame_debug_str_;
+void CefFrameImpl::MaybeApplyHodosFarblingKey() {
+  // Ask the BROWSER for this document's farbling key, synchronously, at the one
+  // moment that works.
+  //
+  // WHY A PULL AND NOT A PUSH -- both push directions are broken by construction,
+  // and both were tried:
+  //   * PRE-COMMIT push (the shell's OnBeforeBrowse send): the document that needs
+  //     the key does not exist yet, so it lands on the OUTGOING document. And it
+  //     cannot be parked for the next one either, because each document gets a NEW
+  //     CefFrameImpl -- proven by frame tokens changing per document.
+  //   * POST-COMMIT push: SendToBrowserFrame queues everything until the
+  //     FrameAttached ack round-trip completes, which is strictly after
+  //     OnContextCreated. A key arriving then has already lost the race against
+  //     the document's first inline script.
+  // A [Sync] pull here is after the right document exists and before page script
+  // runs. That is the entire requirement, and only this satisfies both halves.
+  //
+  // FAIL CLOSED everywhere below: every early return leaves the document with no
+  // key, so HodosSessionCache reports FarblingEnabled() == false and every patched
+  // API returns its native value. Never substitute a default or constant key -- a
+  // degenerate constant-seeded farble is a WORSE fingerprint than none, and it
+  // would silently defeat the auth-domain exemption, which depends on the bypass
+  // being a true native pass-through.
+  if (!frame_ || attach_denied_) {
     return;
   }
 
-  const std::string& hex = arguments[0].GetString();
+  // Main frame only, matching the shell, which sends the key for IsMain() frames.
+  // Subframes and workers are P4e's scope and have no entry to find; skipping them
+  // also keeps this to ONE sync browser round-trip per top-level document rather
+  // than one per frame on an iframe-heavy page.
+  if (frame_->Parent() != nullptr) {
+    return;
+  }
+
+  // Only real web content has a first party to key on. This is also what keeps the
+  // sync IPC off about:blank, the initial empty document, devtools:// and our own
+  // internal UI -- all of which would miss anyway.
+  const GURL url = frame_->GetDocument().Url();
+  if (!url.SchemeIsHTTPOrHTTPS()) {
+    return;
+  }
+  // Parenthesised, not `=`: GURL::host() returns std::string_view on Chromium 150,
+  // and std::string's string_view constructor is explicit, so copy-initialisation
+  // does not compile. We need an owning std::string anyway to pass by const ref.
+  const std::string host(url.host());
+  if (host.empty()) {
+    return;
+  }
+
+  // Skip our own UI. Hodos serves the header and every overlay from
+  // http://127.0.0.1:5137, which IS http, so without this gate each of those
+  // ~15 documents would fire a BLOCKING sync round-trip at startup only to be
+  // told there is no key -- straight onto the first-paint critical path. The
+  // shell never files an entry for these hosts either, so the answer is always
+  // "nothing"; not asking is both faster and semantically right, since internal
+  // UI is never farbled.
+  if (host == "127.0.0.1" || host == "localhost" || host == "[::1]") {
+    return;
+  }
+
+  // Bind if needed but do not disturb the connection state machine: pass the
+  // CURRENT acked-ness rather than asserting it. The remote is normally already
+  // bound here (OnDidCommitProvisionalLoad -> ConnectBrowserFrame precedes
+  // OnContextCreated), and a sync call does NOT require FrameAttached to have been
+  // acked -- CefBrowserFrame::GetHodosFarblingKey answers purely from
+  // browser-process state and never touches the CefFrameHostImpl association.
+  auto& browser_frame = GetBrowserFrame(
+      /*expect_acked=*/browser_connection_state_ ==
+      ConnectionState::CONNECTION_ACKED);
+  if (!browser_frame) {
+    return;
+  }
+
+  std::string key_hex;
+  bool enabled = false;
+  if (!browser_frame->GetHodosFarblingKey(host, &key_hex, &enabled)) {
+    // Sync call failed outright (pipe error / browser going away).
+    return;
+  }
+
+  if (key_hex.empty()) {
+    // A definite "the browser has nothing for this host". Distinct from a failure,
+    // and handled identically on purpose.
+    return;
+  }
+
   std::array<uint8_t, 32> key{};
-  if (hex.size() != key.size() * 2) {
+  if (key_hex.size() != key.size() * 2) {
     LOG(WARNING) << "Hodos: farbling key wrong length; not farbling "
                  << frame_debug_str_;
     return;
   }
   for (size_t i = 0; i < key.size(); ++i) {
     unsigned int byte = 0;
-    if (std::sscanf(hex.c_str() + i * 2, "%2x", &byte) != 1) {
+    if (std::sscanf(key_hex.c_str() + i * 2, "%2x", &byte) != 1) {
       // Reject wholesale rather than farbling with a partially decoded key: a
       // half-random key is not a weaker secret, it is a different fingerprint.
       LOG(WARNING) << "Hodos: farbling key not valid hex; not farbling "
@@ -500,27 +567,7 @@ void CefFrameImpl::HandleHodosFarblingKey(const base::ListValue& arguments) {
     key[i] = static_cast<uint8_t>(byte);
   }
 
-  const bool enabled = arguments[1].GetBool();
-
-  // Remember the key for the document this navigation is ABOUT TO create. The
-  // browser sends pre-commit, so the LocalDOMWindow that has to carry this key
-  // does not exist yet; OnContextCreated applies it.
-  //
-  // ExecuteOnLocalFrame cannot do this job -- see pending_farble_key_ in the
-  // header. It only queues while context_created_ is false, and that flag is set
-  // once and never reset, so from this frame's second document onward it would
-  // run immediately against the OUTGOING document and the new one would farble
-  // nothing.
-  pending_farble_key_ = PendingFarbleKey{key, enabled};
-
-  // Belt and braces for a message that arrives AFTER its own document already
-  // committed: apply to the current document too. When the message is pre-commit
-  // (the normal case) this writes to a document that is being replaced, which is
-  // harmless -- and a cancelled navigation is covered by pending_farble_key_
-  // being overwritten before any context is created.
-  if (context_created_ && frame_) {
-    blink_glue::SetHodosFarblingKey(frame_, key.data(), enabled);
-  }
+  blink_glue::SetHodosFarblingKey(frame_, key.data(), enabled);
 }
 
 void CefFrameImpl::ExecuteOnLocalFrame(const std::string& function_name,
@@ -888,20 +935,17 @@ void CefFrameImpl::FrameAttachedAck(bool allow) {
 
 void CefFrameImpl::SendMessage(const std::string& name,
                                base::ListValue arguments) {
-  // Hodos C2: the farbling key is consumed here rather than forwarded to the client.
+  // Hodos C2: the farbling key must never surface in the client's
+  // OnProcessMessageReceived -- it is deliberately not public CEF API, because the
+  // key has to end up inside Blink (which an embedder cannot reach) and no embedder
+  // should ever hold it.
   //
-  // It is deliberately NOT a public CEF API. The key has to end up inside Blink, and
-  // the client (cef-native) cannot reach Blink internals -- but libcef can, via
-  // blink_glue. Routing it through a CefFrame method would mean a new public virtual,
-  // which changes CEF_API_HASH and adds surface we would carry forever, to deliver a
-  // value no embedder should ever hold.
-  //
-  // ExecuteOnLocalFrame gives the correct timing for free: the browser sends this at
-  // OnBeforeBrowse, i.e. BEFORE the new document's script context exists, so the action
-  // is queued and drained in OnContextCreated -- ahead of any page JS, and against the
-  // right document rather than the one being navigated away from.
+  // This arm should be unreachable: the browser side now consumes the message in
+  // CefFrameHostImpl::SendProcessMessage and turns it into a registry fill, so it
+  // is never put on the wire. Kept as a belt-and-braces drop so that if a future
+  // change starts forwarding it again, the failure is "no farbling" rather than
+  // "the key leaked to the client".
   if (name == kHodosFarblingKeyMessage) {
-    HandleHodosFarblingKey(arguments);
     return;
   }
 

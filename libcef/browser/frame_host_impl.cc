@@ -9,6 +9,7 @@
 #include "cef/include/cef_v8.h"
 #include "cef/include/test/cef_test_helpers.h"
 #include "cef/libcef/browser/browser_host_base.h"
+#include "cef/libcef/browser/hodos_farbling_registry.h"
 #include "cef/libcef/browser/net_service/browser_urlrequest_impl.h"
 #include "cef/libcef/common/frame_util.h"
 #include "cef/libcef/common/net/url_util.h"
@@ -275,6 +276,34 @@ void CefFrameHostImpl::SendProcessMessage(
   DCHECK_EQ(PID_RENDERER, target_process);
   DCHECK(message && message->IsValid());
   if (!message || !message->IsValid()) {
+    return;
+  }
+
+  // Hodos: the farbling key never crosses into a renderer as a push. The shell
+  // still "sends" it per navigation, but that send is a CACHE FILL here, and the
+  // renderer pulls at OnContextCreated over BrowserFrame::GetHodosFarblingKey.
+  //
+  // WHY IT IS INTERCEPTED RATHER THAN GIVEN ITS OWN API: pushing it was the bug.
+  // The shell sends from OnBeforeBrowse, i.e. pre-commit, so the document that
+  // needs the key does not exist yet and the push lands on the outgoing one --
+  // and a new CefFrameImpl per document means the renderer cannot park it either.
+  // Keeping the shell's existing send as the fill means the shell needs no new
+  // concept and this stays a libcef-internal transport change. See
+  // hodos_farbling_registry.h.
+  //
+  // Payload: [0] = 64 lowercase hex chars (the 32-byte per-site key),
+  //          [1] = bool, the browser's already-collapsed ShouldFarble verdict,
+  //          [2] = the registrable domain (eTLD+1) the key was derived for, as
+  //                computed by FarblingPolicy -- this side must NOT re-derive it.
+  if (message->GetName().ToString() == "hodos_farble_key") {
+    CefRefPtr<CefListValue> args = message->GetArgumentList();
+    if (args != nullptr && args->GetSize() >= 3) {
+      hodos::FarblingRegistry::GetInstance().Set(args->GetString(2).ToString(),
+                                                 args->GetString(0).ToString(),
+                                                 args->GetBool(1));
+    }
+    // Consumed either way. Forwarding it would put the key in the client's
+    // OnProcessMessageReceived, which is public surface no embedder should hold.
     return;
   }
 
@@ -664,6 +693,23 @@ void CefFrameHostImpl::OnRenderFrameDisconnect() {
 
   // Reconnect, if any, will be triggered via FrameAttached().
   render_frame_.reset();
+}
+
+void CefFrameHostImpl::GetHodosFarblingKey(
+    const std::string& host,
+    cef::mojom::BrowserFrame::GetHodosFarblingKeyCallback callback) {
+  // Not reached on the normal path -- CefBrowserFrame services the renderer's pull
+  // directly. Implemented for interface completeness, and identically, so that any
+  // future caller gets the same fail-closed answer rather than a crash. Never
+  // invent a key here; an empty reply means "do not farble".
+  std::string key_hex;
+  bool enabled = false;
+  if (!hodos::FarblingRegistry::GetInstance().Lookup(host, &key_hex,
+                                                     &enabled)) {
+    std::move(callback).Run(std::string(), false);
+    return;
+  }
+  std::move(callback).Run(key_hex, enabled);
 }
 
 void CefFrameHostImpl::SendMessage(const std::string& name,

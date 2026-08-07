@@ -41,6 +41,13 @@ class CefBrowserFrame : public CefFrameServiceBase<cef::mojom::BrowserFrame> {
   void UpdateDraggableRegions(
       std::optional<std::vector<cef::mojom::DraggableRegionEntryPtr>> regions)
       override;
+  // Hodos: serves the renderer's pull of this document's farbling material out of
+  // hodos::FarblingRegistry. Answers from browser-process state only -- it does not
+  // touch the CefFrameHostImpl association, so it is safe to service before
+  // FrameAttached has been acked, which is precisely when the renderer needs it.
+  void GetHodosFarblingKey(
+      const std::string& host,
+      cef::mojom::BrowserFrame::GetHodosFarblingKeyCallback callback) override;
 
   CefRefPtr<CefFrameHostImpl> GetFrameHost(bool prefer_speculative,
                                            bool* is_excluded = nullptr) const;
