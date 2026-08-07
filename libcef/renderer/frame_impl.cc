@@ -412,6 +412,18 @@ void CefFrameImpl::OnContextCreated(v8::Local<v8::Context> context) {
   context_created_ = true;
 
   CHECK(frame_);
+
+  // Hodos C2: install the farbling key on THIS document before any page script
+  // runs. Doing it here is the whole point -- the browser delivers the key
+  // pre-commit, so this is the first moment the LocalDOMWindow it belongs to
+  // exists. Consume it, so a later context that gets no message of its own does
+  // not inherit this document's key (fail-closed: no key means no farbling).
+  if (pending_farble_key_) {
+    blink_glue::SetHodosFarblingKey(frame_, pending_farble_key_->key.data(),
+                                    pending_farble_key_->enabled);
+    pending_farble_key_.reset();
+  }
+
   while (!queued_context_actions_.empty()) {
     auto& action = queued_context_actions_.front();
     std::move(action.second).Run(frame_);
@@ -489,13 +501,26 @@ void CefFrameImpl::HandleHodosFarblingKey(const base::ListValue& arguments) {
   }
 
   const bool enabled = arguments[1].GetBool();
-  ExecuteOnLocalFrame(
-      __FUNCTION__,
-      base::BindOnce(
-          [](std::array<uint8_t, 32> k, bool en, blink::WebLocalFrame* frame) {
-            blink_glue::SetHodosFarblingKey(frame, k.data(), en);
-          },
-          key, enabled));
+
+  // Remember the key for the document this navigation is ABOUT TO create. The
+  // browser sends pre-commit, so the LocalDOMWindow that has to carry this key
+  // does not exist yet; OnContextCreated applies it.
+  //
+  // ExecuteOnLocalFrame cannot do this job -- see pending_farble_key_ in the
+  // header. It only queues while context_created_ is false, and that flag is set
+  // once and never reset, so from this frame's second document onward it would
+  // run immediately against the OUTGOING document and the new one would farble
+  // nothing.
+  pending_farble_key_ = PendingFarbleKey{key, enabled};
+
+  // Belt and braces for a message that arrives AFTER its own document already
+  // committed: apply to the current document too. When the message is pre-commit
+  // (the normal case) this writes to a document that is being replaced, which is
+  // harmless -- and a cancelled navigation is covered by pending_farble_key_
+  // being overwritten before any context is created.
+  if (context_created_ && frame_) {
+    blink_glue::SetHodosFarblingKey(frame_, key.data(), enabled);
+  }
 }
 
 void CefFrameImpl::ExecuteOnLocalFrame(const std::string& function_name,
