@@ -485,6 +485,13 @@ void CefFrameImpl::MaybeApplyHodosFarblingKey() {
   // degenerate constant-seeded farble is a WORSE fingerprint than none, and it
   // would silently defeat the auth-domain exemption, which depends on the bypass
   // being a true native pass-through.
+  // TEMP DIAG3: logged at ENTRY so "never called" is distinguishable from
+  // "returned early at a gate".
+  LOG(WARNING) << "FARBLE-DIAG3 ENTER frame=" << (frame_ ? 1 : 0)
+               << " denied=" << attach_denied_
+               << " parent=" << ((frame_ && frame_->Parent()) ? 1 : 0)
+               << " url=" << (frame_ ? GURL(frame_->GetDocument().Url()).spec()
+                                     : std::string("<none>"));
   if (!frame_ || attach_denied_) {
     return;
   }
@@ -532,13 +539,25 @@ void CefFrameImpl::MaybeApplyHodosFarblingKey() {
   auto& browser_frame = GetBrowserFrame(
       /*expect_acked=*/browser_connection_state_ ==
       ConnectionState::CONNECTION_ACKED);
+  // TEMP DIAG3 (revert once the intermittent no-farble is understood)
+  LOG(WARNING) << "FARBLE-DIAG3 PULL host=" << host
+               << " bound=" << browser_frame.is_bound()
+               << " connState=" << static_cast<int>(browser_connection_state_)
+               << " " << frame_debug_str_;
   if (!browser_frame) {
+    LOG(WARNING) << "FARBLE-DIAG3 no remote; not farbling";
     return;
   }
 
   std::string key_hex;
   bool enabled = false;
-  if (!browser_frame->GetHodosFarblingKey(host, &key_hex, &enabled)) {
+  const bool sync_ok =
+      browser_frame->GetHodosFarblingKey(host, &key_hex, &enabled);
+  // TEMP DIAG3
+  LOG(WARNING) << "FARBLE-DIAG3 SYNC ok=" << sync_ok
+               << " keyLen=" << key_hex.size() << " enabled=" << enabled
+               << " host=" << host;
+  if (!sync_ok) {
     // Sync call failed outright (pipe error / browser going away).
     return;
   }
@@ -567,6 +586,8 @@ void CefFrameImpl::MaybeApplyHodosFarblingKey() {
     key[i] = static_cast<uint8_t>(byte);
   }
 
+  // TEMP DIAG3
+  LOG(WARNING) << "FARBLE-DIAG3 APPLY enabled=" << enabled << " host=" << host;
   blink_glue::SetHodosFarblingKey(frame_, key.data(), enabled);
 }
 
