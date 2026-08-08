@@ -54,11 +54,8 @@ void CefBrowserFrame::GetHodosFarblingKey(
     cef::mojom::BrowserFrame::GetHodosFarblingKeyCallback callback) {
   std::string key_hex;
   bool enabled = false;
-  // TEMP DIAG3
-  LOG(WARNING) << "FARBLE-DIAG3 BROWSER-SERVE host=" << host;
   if (!hodos::FarblingRegistry::GetInstance().Lookup(host, &key_hex,
                                                      &enabled)) {
-    LOG(WARNING) << "FARBLE-DIAG3 BROWSER-SERVE MISS host=" << host;
     // Nothing filed for this host. Reply with an empty key rather than dropping
     // the callback: the renderer is blocked on this sync call, and it needs a
     // definite "no key" to fail closed on. Never invent a key here -- a constant
