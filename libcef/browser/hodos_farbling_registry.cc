@@ -4,6 +4,7 @@
 
 #include "cef/libcef/browser/hodos_farbling_registry.h"
 
+#include "base/logging.h"
 #include "base/no_destructor.h"
 #include "base/strings/string_util.h"
 
@@ -48,6 +49,8 @@ void FarblingRegistry::Set(const std::string& registrable_domain,
   // DIFFERENT and unpredictable fingerprint, and storing one would quietly defeat
   // the fail-closed contract the whole design rests on.
   if (key_hex.size() != kKeyHexLength || !IsLowercaseHex(key_hex)) {
+    LOG(WARNING) << "FARBLE-DIAG4 Set REJECTED keyLen=" << key_hex.size()
+                 << " lowerhex=" << IsLowercaseHex(key_hex);
     return;
   }
 
@@ -57,6 +60,8 @@ void FarblingRegistry::Set(const std::string& registrable_domain,
 
   base::AutoLock lock(lock_);
   entries_[domain] = Entry{key_hex, enabled};
+  LOG(WARNING) << "FARBLE-DIAG4 Set STORED '" << domain << "' enabled=" << enabled
+               << " entries=" << entries_.size() << " inst=" << this;
 }
 
 bool FarblingRegistry::Lookup(const std::string& host,
@@ -74,6 +79,8 @@ bool FarblingRegistry::Lookup(const std::string& host,
   // both "github.io" and "user.github.io" are registrable domains in their own
   // right and both have been visited, "user.github.io" must not be served
   // "github.io"'s key -- they are separate first parties.
+  LOG(WARNING) << "FARBLE-DIAG4 Lookup needle='" << needle
+               << "' entries=" << entries_.size() << " inst=" << this;
   const Entry* best = nullptr;
   size_t best_len = 0;
 

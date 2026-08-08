@@ -297,7 +297,13 @@ void CefFrameHostImpl::SendProcessMessage(
   //                computed by FarblingPolicy -- this side must NOT re-derive it.
   if (message->GetName().ToString() == "hodos_farble_key") {
     CefRefPtr<CefListValue> args = message->GetArgumentList();
+    // TEMP DIAG4
+    LOG(WARNING) << "FARBLE-DIAG4 INTERCEPT args="
+                 << (args != nullptr ? static_cast<int>(args->GetSize()) : -1);
     if (args != nullptr && args->GetSize() >= 3) {
+      LOG(WARNING) << "FARBLE-DIAG4 FILL rd='" << args->GetString(2).ToString()
+                   << "' keyLen=" << args->GetString(0).ToString().size()
+                   << " enabled=" << args->GetBool(1);
       hodos::FarblingRegistry::GetInstance().Set(args->GetString(2).ToString(),
                                                  args->GetString(0).ToString(),
                                                  args->GetBool(1));
