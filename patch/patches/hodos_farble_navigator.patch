@@ -1,0 +1,87 @@
+diff --git third_party/blink/renderer/core/execution_context/navigator_base.cc third_party/blink/renderer/core/execution_context/navigator_base.cc
+index cccfafe8f93a0..eeeb4b8bf484a 100644
+--- third_party/blink/renderer/core/execution_context/navigator_base.cc
++++ third_party/blink/renderer/core/execution_context/navigator_base.cc
+@@ -8,6 +8,7 @@
+ #include "build/build_config.h"
+ #include "third_party/blink/public/common/features.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/core/execution_context/hodos_session_cache.h"
+ #include "third_party/blink/renderer/core/frame/navigator_concurrent_hardware.h"
+ #include "third_party/blink/renderer/core/probe/core_probes.h"
+ #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
+@@ -75,9 +76,39 @@ unsigned int NavigatorBase::hardwareConcurrency() const {
+ 
+   probe::ApplyHardwareConcurrencyOverride(
+       probe::ToCoreProbeSink(GetExecutionContext()), hardware_concurrency);
++
++  // --- Hodos farbling (C6) -------------------------------------------------
++  // Applied AFTER the DevTools probe override so that an explicitly emulated core count
++  // still farbles like a real one, rather than the two mechanisms fighting.
++  //
++  // REDUCE-ONLY: the result never exceeds the machine's real core count. An inflated
++  // count is contradicted by any timing the page can measure for itself, which would
++  // make this a new fingerprinting signal instead of a masked one. See
++  // HodosSessionCache::FarbleHardwareConcurrency.
++  if (ExecutionContext* execution_context = GetExecutionContext()) {
++    hardware_concurrency = HodosSessionCache::From(*execution_context)
++                               .FarbleHardwareConcurrency(hardware_concurrency);
++  }
+   return hardware_concurrency;
+ }
+ 
++float NavigatorBase::deviceMemory() const {
++  const float native = NavigatorDeviceMemory::deviceMemory();
++
++  // --- Hodos farbling (C6) -------------------------------------------------
++  // Reported to the page from a desktop-plausible set this engine could itself produce
++  // ({4, 8, 16, 32}); see HodosSessionCache::FarbleDeviceMemory, which also carries the
++  // tripwire for the upstream feature flag that defines that range.
++  //
++  // This value buys an attacker only ~3-4 bits, so it is farbled less to hide entropy
++  // than to avoid being the one navigator property that fails to move -- an unfarbled
++  // outlier next to farbled neighbours is itself a signal.
++  if (ExecutionContext* execution_context = GetExecutionContext()) {
++    return HodosSessionCache::From(*execution_context).FarbleDeviceMemory(native);
++  }
++  return native;
++}
++
+ ExecutionContext* NavigatorBase::GetUAExecutionContext() const {
+   return GetExecutionContext();
+ }
+diff --git third_party/blink/renderer/core/execution_context/navigator_base.h third_party/blink/renderer/core/execution_context/navigator_base.h
+index c19ffa6ff9e17..9ced33b9fe460 100644
+--- third_party/blink/renderer/core/execution_context/navigator_base.h
++++ third_party/blink/renderer/core/execution_context/navigator_base.h
+@@ -56,6 +56,12 @@ class CORE_EXPORT NavigatorBase : public ScriptWrappable,
+ 
+   unsigned int hardwareConcurrency() const override;
+ 
++  // Hodos farbling (C6). Overridden here rather than in NavigatorDeviceMemory itself
++  // because this is the lowest class in the hierarchy that has an ExecutionContext, and
++  // therefore the per-origin HodosSessionCache. hardwareConcurrency above is farbled in
++  // the same place, for the same reason -- it was already overridden here upstream.
++  float deviceMemory() const override;
++
+  protected:
+   ExecutionContext* GetUAExecutionContext() const override;
+   UserAgentMetadata GetUserAgentMetadata() const override;
+diff --git third_party/blink/renderer/core/frame/navigator_device_memory.h third_party/blink/renderer/core/frame/navigator_device_memory.h
+index 33fe17542a9c1..60b58e0957418 100644
+--- third_party/blink/renderer/core/frame/navigator_device_memory.h
++++ third_party/blink/renderer/core/frame/navigator_device_memory.h
+@@ -11,7 +11,12 @@ namespace blink {
+ 
+ class CORE_EXPORT NavigatorDeviceMemory {
+  public:
+-  float deviceMemory() const;
++  // Hodos farbling (C6): virtual so NavigatorBase can override it, which is the only way
++  // this value can be farbled -- the mixin itself has no ExecutionContext, while
++  // NavigatorBase is an ExecutionContextClient and is the common base of both Navigator
++  // and WorkerNavigator. This mirrors NavigatorConcurrentHardware::hardwareConcurrency(),
++  // which is already virtual and already overridden there for the same structural reason.
++  virtual float deviceMemory() const;
+ };
+ 
+ }  // namespace blink

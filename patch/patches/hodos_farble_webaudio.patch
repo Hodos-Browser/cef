@@ -1,0 +1,152 @@
+diff --git third_party/blink/renderer/modules/webaudio/analyser_node.cc third_party/blink/renderer/modules/webaudio/analyser_node.cc
+index 688a2fec77ee2..25ec84fc9c842 100644
+--- third_party/blink/renderer/modules/webaudio/analyser_node.cc
++++ third_party/blink/renderer/modules/webaudio/analyser_node.cc
+@@ -26,6 +26,8 @@
+ #include "third_party/blink/renderer/modules/webaudio/analyser_node.h"
+ 
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_analyser_options.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/core/execution_context/hodos_session_cache.h"
+ #include "third_party/blink/renderer/modules/webaudio/analyser_handler.h"
+ #include "third_party/blink/renderer/modules/webaudio/audio_graph_tracer.h"
+ #include "third_party/blink/renderer/modules/webaudio/base_audio_context.h"
+@@ -119,6 +121,23 @@ double AnalyserNode::smoothingTimeConstant() const {
+ void AnalyserNode::getFloatFrequencyData(NotShared<DOMFloat32Array> array) {
+   GetAnalyserHandler().GetFloatFrequencyData(array.Get(),
+                                              context()->currentTime());
++
++  // --- Hodos farbling (C5) -------------------------------------------------
++  // The second half of the WebAudio surface the outgoing JavaScript wrapped. Unlike
++  // AudioBuffer::getChannelData this needs no once-only bookkeeping: `array` is the
++  // caller's destination and the handler refills it from scratch on every call, so
++  // applying the same deterministic factor each time reproduces the same values rather
++  // than compounding.
++  //
++  // These samples are decibels (negative, roughly [-100, 0]), so the multiplier nudges
++  // them toward or away from zero by ~2e-5 dB -- inaudible, unplottable, and enough to
++  // move a hash.
++  if (array) {
++    if (ExecutionContext* execution_context = GetExecutionContext()) {
++      HodosSessionCache::From(*execution_context)
++          .PerturbAudioSamples(array->Data(), array->length());
++    }
++  }
+ }
+ 
+ void AnalyserNode::getByteFrequencyData(NotShared<DOMUint8Array> array) {
+diff --git third_party/blink/renderer/modules/webaudio/audio_buffer.cc third_party/blink/renderer/modules/webaudio/audio_buffer.cc
+index bc4c0c6ca00c1..55b4cafa22aec 100644
+--- third_party/blink/renderer/modules/webaudio/audio_buffer.cc
++++ third_party/blink/renderer/modules/webaudio/audio_buffer.cc
+@@ -33,6 +33,8 @@
+ #include "base/compiler_specific.h"
+ #include "base/containers/span.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_audio_buffer_options.h"
++#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/core/execution_context/hodos_session_cache.h"
+ #include "third_party/blink/renderer/modules/webaudio/base_audio_context.h"
+ #include "third_party/blink/renderer/platform/audio/audio_bus.h"
+ #include "third_party/blink/renderer/platform/audio/audio_utilities.h"
+@@ -202,6 +204,7 @@ AudioBuffer::AudioBuffer(AudioBus* bus)
+ }
+ 
+ NotShared<DOMFloat32Array> AudioBuffer::getChannelData(
++    ExecutionContext* execution_context,
+     unsigned channel_index,
+     ExceptionState& exception_state) {
+   if (channel_index >= channels_.size()) {
+@@ -213,7 +216,31 @@ NotShared<DOMFloat32Array> AudioBuffer::getChannelData(
+     return NotShared<DOMFloat32Array>(nullptr);
+   }
+ 
+-  return getChannelData(channel_index);
++  NotShared<DOMFloat32Array> channel_data = getChannelData(channel_index);
++
++  // --- Hodos farbling (C5) -------------------------------------------------
++  // The canonical WebAudio fingerprint renders a tone through a DynamicsCompressor in an
++  // OfflineAudioContext and hashes the samples this returns, so this is the readback that
++  // matters. A ~1.0 +/- 2e-7 multiplier sits far below the audible floor and below the
++  // precision fingerprinters hash at, yet moves the hash.
++  //
++  // Perturb ONCE per channel -- see farbled_channels_ in the header for why re-applying a
++  // deterministic factor to the buffer's own storage would compound and destroy the
++  // intra-session consistency the scheme depends on.
++  if (execution_context && channel_data) {
++    HodosSessionCache& cache = HodosSessionCache::From(*execution_context);
++    if (cache.FarblingEnabled()) {
++      if (farbled_channels_.size() < channels_.size()) {
++        farbled_channels_.resize(channels_.size());
++      }
++      if (!farbled_channels_[channel_index]) {
++        farbled_channels_[channel_index] = true;
++        cache.PerturbAudioSamples(channel_data->Data(), channel_data->length());
++      }
++    }
++  }
++
++  return channel_data;
+ }
+ 
+ NotShared<DOMFloat32Array> AudioBuffer::getChannelData(unsigned channel_index) {
+diff --git third_party/blink/renderer/modules/webaudio/audio_buffer.h third_party/blink/renderer/modules/webaudio/audio_buffer.h
+index 4bbf70b4398c4..a2b9ebc392fc3 100644
+--- third_party/blink/renderer/modules/webaudio/audio_buffer.h
++++ third_party/blink/renderer/modules/webaudio/audio_buffer.h
+@@ -43,6 +43,7 @@ namespace blink {
+ class AudioBus;
+ class AudioBufferOptions;
+ class ExceptionState;
++class ExecutionContext;
+ class SharedAudioBuffer;
+ 
+ class MODULES_EXPORT AudioBuffer final : public ScriptWrappable {
+@@ -89,7 +90,13 @@ class MODULES_EXPORT AudioBuffer final : public ScriptWrappable {
+ 
+   // Channel data access
+   unsigned numberOfChannels() const { return channels_.size(); }
+-  NotShared<DOMFloat32Array> getChannelData(unsigned channel_index,
++  // Hodos farbling (C5): this is the bindings-facing overload -- the only one a page can
++  // reach, and the only one that farbles. The context-free overload below is what
++  // Blink's own internals call (copyFromChannel, CreateSharedAudioBuffer, the audio
++  // graph) and it deliberately returns untouched data: farbling exists to perturb what a
++  // PAGE can observe, not to alter what the engine renders and plays.
++  NotShared<DOMFloat32Array> getChannelData(ExecutionContext*,
++                                            unsigned channel_index,
+                                             ExceptionState&);
+   NotShared<DOMFloat32Array> getChannelData(unsigned channel_index);
+   void copyFromChannel(NotShared<DOMFloat32Array>,
+@@ -123,6 +130,17 @@ class MODULES_EXPORT AudioBuffer final : public ScriptWrappable {
+   uint32_t length_;
+ 
+   HeapVector<Member<DOMFloat32Array>> channels_;
++
++  // Hodos farbling (C5): which channels have already been perturbed by the
++  // bindings-facing getChannelData. Empty until the first such call.
++  //
++  // This bookkeeping is not optional. getChannelData hands back the buffer's OWN
++  // storage, and the fudge factor is deterministic, so perturbing on every call would
++  // multiply the samples by factor^n and drift the values further on each read --
++  // destroying the intra-session consistency the whole scheme rests on (a fingerprint
++  // that changes as you read it is itself a fingerprint). Perturb once; every later read
++  // then returns the identical farbled samples.
++  Vector<bool> farbled_channels_;
+ };
+ 
+ // Shared data that audio threads can hold onto.
+diff --git third_party/blink/renderer/modules/webaudio/audio_buffer.idl third_party/blink/renderer/modules/webaudio/audio_buffer.idl
+index 48bf56bf82542..ca3bdf58773d9 100644
+--- third_party/blink/renderer/modules/webaudio/audio_buffer.idl
++++ third_party/blink/renderer/modules/webaudio/audio_buffer.idl
+@@ -37,7 +37,10 @@
+ 
+     // Channel access
+     readonly attribute unsigned long numberOfChannels;
+-    [Measure, RaisesException] Float32Array getChannelData(
++    // Hodos farbling (C5): CallWith=ExecutionContext is the only way this method can
++    // reach the per-origin HodosSessionCache -- AudioBuffer is a bare ScriptWrappable
++    // with no context of its own, unlike AnalyserNode which can go through context().
++    [Measure, CallWith=ExecutionContext, RaisesException] Float32Array getChannelData(
+         unsigned long channelIndex);
+     [Measure, RaisesException] void copyFromChannel(
+         Float32Array destination,

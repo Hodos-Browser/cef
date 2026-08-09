@@ -82,9 +82,46 @@ git_apply_patch_file`), preceded by a reverse-check. So:
 | `name` | Feature | Q5 row | Targets | `condition` | Generated against | Last rebase | Last apply reading |
 |---|---|---|---|---|---|---|---|
 | `hodos_farble_session_cache` | C1 `HodosSessionCache` Supplement | C1 | `core/execution_context/build.gni` (2-line hunk) + **2 new files** `hodos_session_cache.{h,cc}` | `HODOS_FARBLING` | `94c1726` / Chromium `150.0.7871.187` | — (initial) | `115 patches total (1 applied, 114 skipped, 0 failed)` |
-| `hodos_farble_canvas2d` | C3 Canvas 2D readback farbling | C3 | `modules/canvas/canvas2d/base_rendering_context_2d.cc` (`getImageDataInternal`) + `core/html/canvas/html_canvas_element.cc` (helper + the 2 encode callers of `Snapshot`) | `HODOS_FARBLING` | `94c1726` / Chromium `150.0.7871.187` | — (initial) | ⏳ owed — needs a CEF build |
+| `hodos_farble_canvas2d` | C3 Canvas 2D readback farbling | C3 | `modules/canvas/canvas2d/base_rendering_context_2d.cc` (`getImageDataInternal`) + `core/html/canvas/html_canvas_element.cc` (helper + the 2 encode callers of `Snapshot`) | `HODOS_FARBLING` | `94c1726` / Chromium `150.0.7871.187` | — (initial) | ✅ compiled — symbols verified in `libcef`, Windows + macOS |
+| `hodos_farble_webgl` | C4 WebGL `readPixels` farbling | C4 | `modules/webgl/webgl_rendering_context_base.cc` (`ReadPixelsHelper`, one hook) | `HODOS_FARBLING` | `94c1726` / Chromium `150.0.7871.187` | — (initial) | ⏳ owed — needs a CEF build |
+| `hodos_farble_webaudio` | C5 WebAudio farbling | C5 | `modules/webaudio/audio_buffer.{idl,h,cc}` (`getChannelData`) + `modules/webaudio/analyser_node.cc` (`getFloatFrequencyData`) | `HODOS_FARBLING` | `94c1726` / Chromium `150.0.7871.187` | — (initial) | ⏳ owed — needs a CEF build |
+| `hodos_farble_navigator` | C6 `deviceMemory` + `hardwareConcurrency` | C6 | `core/execution_context/navigator_base.{h,cc}` + `core/frame/navigator_device_memory.h` (one line: make virtual) | `HODOS_FARBLING` | `94c1726` / Chromium `150.0.7871.187` | — (initial) | ⏳ owed — needs a CEF build |
 
-Registered count is now **116** (upstream 114 + C1 + C3). `hodos_noop_probe` stood the toolchain up,
+**C4/C5/C6 were authored as ONE commit and cost ONE build per platform.** They touch disjoint files,
+depend only on C1, and have no ordering relationship with one another, so four separate ~5 h builds
+would have bought nothing. Each is still its **own** `.patch`, so a defective one can be dropped
+without disturbing the others — that separability is what makes a batch auditable rather than merely
+fast.
+
+> **C7 has no entry here, and that is not an omission.** The auth-domain allowlist and the user's
+> per-site toggle are already collapsed into C2's single `enabled` bit in the **shell**
+> (`simple_handler.cpp :: OnBeforeBrowse`), which is exactly where Q3 §2.1 says the decision belongs.
+> C7 therefore needs no Chromium patch and no CEF rebuild; what remains under that label is
+> shell-side teardown of the legacy JS seed path.
+
+### C4/C5/C6 — the things a rebase must not "simplify"
+
+1. **C5's once-per-channel perturbation is correctness, not an optimisation.** `getChannelData`
+   returns the AudioBuffer's OWN storage and the fudge factor is deterministic, so perturbing on
+   every call multiplies by factor^n and drifts the samples further on each read. `farbled_channels_`
+   is what makes the second read return the *same* farbled data. `getFloatFrequencyData` deliberately
+   has no such flag — it fills the caller's array fresh each call, so re-applying reproduces rather
+   than compounds. Do not "unify" the two paths.
+2. **C5 farbles only the bindings-facing `getChannelData` overload.** The context-free overload is
+   what Blink's own internals call (`copyFromChannel`, `CreateSharedAudioBuffer`, the audio graph);
+   farbling it would perturb what the engine renders and plays, not merely what a page can observe.
+3. **C6 must never inflate `hardwareConcurrency`.** Reduce-only, floored at 2. An inflated core count
+   is contradicted by timing the page can measure for itself, which turns a masking measure into a
+   *new* fingerprinting signal.
+4. **C6's `deviceMemory` set is bound to an upstream feature flag.** `{4,8,16,32}` is in-range only
+   because `kUpdatedDeviceMemoryLimitsFor2026` is `ENABLED_BY_DEFAULT` here, raising the desktop cap
+   from 8 to 32. If a bump removes or disables it, 16 and 32 become values no real Chrome reports and
+   this patch starts marking us instead of hiding us. Re-read
+   `blink/common/device_memory/approximated_device_memory.cc` on every rebase.
+5. **C4 hooks `ReadPixelsHelper`, not the `readPixels` overloads.** All of them — WebGL1's and
+   WebGL2's three — funnel through it, and `WebGL2RenderingContextBase` does not override it.
+
+Registered count is now **119** (upstream 114 + C1 + C3 + C4 + C5 + C6). `hodos_noop_probe` stood the toolchain up,
 was proven end to end, and was removed per OQ-7 before C1 landed.
 
 > ⚠️ **Do not turn that number into a gate.** It is a ledger entry, not an assertion — see §2b. The

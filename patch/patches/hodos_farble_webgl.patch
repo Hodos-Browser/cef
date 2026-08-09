@@ -1,0 +1,54 @@
+diff --git third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+index ceb4c3f606e9f..fe5981b8eeba2 100644
+--- third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
++++ third_party/blink/renderer/modules/webgl/webgl_rendering_context_base.cc
+@@ -74,6 +74,7 @@
+ #include "third_party/blink/renderer/bindings/modules/v8/v8_webgl_copy_element_image_config.h"
+ #include "third_party/blink/renderer/bindings/modules/v8/webgl_any.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/core/execution_context/hodos_session_cache.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+ #include "third_party/blink/renderer/core/frame/local_frame_client.h"
+@@ -5341,6 +5342,41 @@ void WebGLRenderingContextBase::ReadPixelsHelper(GLint x,
+     }
+     ContextGL()->ReadPixels(x, y, width, height, format, type, data);
+   }
++
++  // --- Hodos farbling (C4) -------------------------------------------------
++  // Framebuffer readback is its own fingerprinting vector and its own code path: the
++  // canvas hook (C3) sits in the 2D context and in HTMLCanvasElement's encode callers,
++  // neither of which a WebGL context passes through.
++  //
++  // This is the single funnel for every readPixels entry point. WebGL2's three
++  // overloads all delegate here, and WebGL2RenderingContextBase does not override it, so
++  // one hook covers WebGL1 and WebGL2 alike.
++  //
++  // `data` points into the caller's own ArrayBufferView, freshly filled by the driver on
++  // every call, so perturbing it in place cannot compound the way a persistent buffer
++  // would -- each call re-reads native pixels and re-applies the same deterministic
++  // noise, which is exactly the intra-session consistency we need.
++  //
++  // Gate and perturbation match the JavaScript this replaces byte for byte
++  // (`pixels.length < 262144`, low bit of every 4th byte at a 3% rate), so an
++  // already-enrolled user's WebGL fingerprint does not move underneath them. 262144
++  // bytes of RGBA8 is 65536 pixels -- the same surface bound the canvas gate uses.
++  //
++  // The PBO variant of readPixels (WebGL2's `int64_t offset` overload writing into a
++  // bound PIXEL_PACK_BUFFER) never reaches this code with a CPU pointer and is a logged
++  // accepted gap, not an oversight.
++  // NB: CanvasRenderingContext spells this GetExecutionContext(), where the Canvas2D hook
++  // in C3 calls GetTopExecutionContext() directly on the host. They resolve to the same
++  // context -- this one is a thin wrapper that adds a null-host guard -- so do not "align"
++  // the two call sites by name; only this spelling compiles here.
++  const size_t read_bytes = buffer_size.ValueOrDie();
++  if (data && read_bytes < 262144u) {
++    if (ExecutionContext* execution_context = GetExecutionContext()) {
++      HodosSessionCache::From(*execution_context)
++          .PerturbPixels(data, read_bytes,
++                         HodosSessionCache::Stream::kWebglReadPixels);
++    }
++  }
+ }
+ 
+ void WebGLRenderingContextBase::RenderbufferStorageImpl(

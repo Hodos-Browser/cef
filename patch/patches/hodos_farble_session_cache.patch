@@ -13,10 +13,10 @@ index a158629b41b26..e904c1930ac07 100644
    "remote_security_context.cc",
 diff --git third_party/blink/renderer/core/execution_context/hodos_session_cache.cc third_party/blink/renderer/core/execution_context/hodos_session_cache.cc
 new file mode 100644
-index 0000000000000..80da6f5c2a90d
+index 0000000000000..df96e72e9f1c2
 --- /dev/null
 +++ third_party/blink/renderer/core/execution_context/hodos_session_cache.cc
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,193 @@
 +// Copyright 2026 Marston Enterprises. All rights reserved.
 +// Use of this source code is governed by a BSD-style license identical to
 +// Chromium's; see the Chromium LICENSE file in the root of this tree.
@@ -24,6 +24,8 @@ index 0000000000000..80da6f5c2a90d
 +// Clean-room provenance: see the header.
 +
 +#include "third_party/blink/renderer/core/execution_context/hodos_session_cache.h"
++
++#include <iterator>
 +
 +#include "third_party/blink/renderer/core/execution_context/execution_context.h"
 +
@@ -166,6 +168,43 @@ index 0000000000000..80da6f5c2a90d
 +  return 1.0 + (prng.NextDouble() - 0.5) * 0.0000004;
 +}
 +
++void HodosSessionCache::PerturbAudioSamples(float* samples, size_t count) {
++  if (!FarblingEnabled() || !samples) {
++    return;
++  }
++  const double fudge = AudioFudgeFactor();
++  for (size_t i = 0; i < count; ++i) {
++    samples[i] = static_cast<float>(samples[i] * fudge);
++  }
++}
++
++float HodosSessionCache::FarbleDeviceMemory(float native) {
++  if (!FarblingEnabled()) {
++    return native;
++  }
++  // Every entry is a value this engine's own approximation can produce, so the result
++  // is indistinguishable from an honest answer given by some other desktop.
++  static constexpr float kDesktopValues[] = {4.0f, 8.0f, 16.0f, 32.0f};
++  HodosPrng prng = MakePrng(Stream::kDeviceMemory);
++  const uint32_t index = prng.Next() % std::size(kDesktopValues);
++  return kDesktopValues[index];
++}
++
++unsigned HodosSessionCache::FarbleHardwareConcurrency(unsigned real) {
++  // kFloor is why this cannot report 1: a single-core claim is rare enough on a desktop
++  // to be conspicuous, and it also changes how sites schedule work rather than merely
++  // what they record.
++  constexpr unsigned kFloor = 2u;
++  if (!FarblingEnabled() || real <= kFloor) {
++    return real;
++  }
++  HodosPrng prng = MakePrng(Stream::kHardwareConcurrency);
++  // Uniform over [kFloor, real] inclusive -- so the true value stays reachable, and the
++  // result can never exceed it.
++  const unsigned span = real - kFloor + 1u;
++  return kFloor + (prng.Next() % span);
++}
++
 +void HodosSessionCache::Trace(Visitor* visitor) const {
 +  Supplement<ExecutionContext>::Trace(visitor);
 +}
@@ -173,10 +212,10 @@ index 0000000000000..80da6f5c2a90d
 +}  // namespace blink
 diff --git third_party/blink/renderer/core/execution_context/hodos_session_cache.h third_party/blink/renderer/core/execution_context/hodos_session_cache.h
 new file mode 100644
-index 0000000000000..cac3859c576d3
+index 0000000000000..291354c13c9f2
 --- /dev/null
 +++ third_party/blink/renderer/core/execution_context/hodos_session_cache.h
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,175 @@
 +// Copyright 2026 Marston Enterprises. All rights reserved.
 +// Use of this source code is governed by a BSD-style license identical to
 +// Chromium's; see the Chromium LICENSE file in the root of this tree.
@@ -279,6 +318,8 @@ index 0000000000000..cac3859c576d3
 +    kCanvas = 1,
 +    kWebglReadPixels = 2,
 +    kAudio = 3,
++    kDeviceMemory = 4,
++    kHardwareConcurrency = 5,
 +  };
 +
 +  HodosPrng MakePrng(Stream stream) const;
@@ -297,6 +338,44 @@ index 0000000000000..cac3859c576d3
 +  // the precision most fingerprinters hash at, but enough to move the hash. Returns
 +  // exactly 1.0 when farbling is disabled, so callers may multiply unconditionally.
 +  double AudioFudgeFactor();
++
++  // Applies AudioFudgeFactor() to `count` float samples in place (C5). One factor for
++  // the whole run, not one per sample, matching the JavaScript this replaces
++  // (`var fudge = ...` hoisted out of the loop). No-op when farbling is disabled, so
++  // callers need no branch of their own.
++  //
++  // ⚠️ The factor is DETERMINISTIC, so this is not idempotent in the way a caller might
++  // assume: applying it twice to the same storage yields factor^2 and drifts further on
++  // every repeat. Callers that perturb a buffer they do not own -- i.e. anything whose
++  // storage survives the call -- must perturb it exactly ONCE and remember that they
++  // did. Callers handed a fresh destination array each call (getFloatFrequencyData)
++  // have no such obligation.
++  void PerturbAudioSamples(float* samples, size_t count);
++
++  // navigator.deviceMemory (C6). Returns a value drawn from the desktop-plausible set
++  // {4, 8, 16, 32} -- a subset of what this engine's own ApproximatedDeviceMemory can
++  // report (powers of two in [2, 32], per kUpdatedDeviceMemoryLimitsFor2026, which is
++  // enabled by default here), so we never emit a quantity real Chrome could not.
++  //
++  // Deliberately NOT Brave's {0.25 ... 8}: that set is mobile-inclusive and caps at 8,
++  // which on a desktop is itself the tell. Returns `native` unchanged when farbling is
++  // disabled.
++  //
++  // ⚠️ TRIPWIRE for an engine bump: if kUpdatedDeviceMemoryLimitsFor2026 is removed or
++  // flipped off upstream, the cap returns to 8 and 16/32 become out-of-set values --
++  // i.e. this stops hiding us and starts marking us. Re-read
++  // blink/common/device_memory/approximated_device_memory.cc on every rebase.
++  float FarbleDeviceMemory(float native);
++
++  // navigator.hardwareConcurrency (C6). REDUCE-ONLY: the result is always <= the real
++  // core count, floored at 2. Never inflates.
++  //
++  // Inflation is not a symmetric choice. A 4-core machine claiming 16 is contradicted by
++  // any timing measurement the page can take for itself, so an inflated count is a NEW
++  // fingerprinting signal rather than a masked one. Reducing is merely conservative --
++  // plenty of real machines have few cores. Returns `real` unchanged when farbling is
++  // disabled, or when `real` is already at or below the floor.
++  unsigned FarbleHardwareConcurrency(unsigned real);
 +
 +  void Trace(Visitor*) const override;
 +
