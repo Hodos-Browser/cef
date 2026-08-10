@@ -13,10 +13,10 @@ index a158629b41b26..e904c1930ac07 100644
    "remote_security_context.cc",
 diff --git third_party/blink/renderer/core/execution_context/hodos_session_cache.cc third_party/blink/renderer/core/execution_context/hodos_session_cache.cc
 new file mode 100644
-index 0000000000000..df96e72e9f1c2
+index 0000000000000..a62d64210dbd4
 --- /dev/null
 +++ third_party/blink/renderer/core/execution_context/hodos_session_cache.cc
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,224 @@
 +// Copyright 2026 Marston Enterprises. All rights reserved.
 +// Use of this source code is governed by a BSD-style license identical to
 +// Chromium's; see the Chromium LICENSE file in the root of this tree.
@@ -165,7 +165,38 @@ index 0000000000000..df96e72e9f1c2
 +    return 1.0;
 +  }
 +  HodosPrng prng = MakePrng(Stream::kAudio);
-+  return 1.0 + (prng.NextDouble() - 0.5) * 0.0000004;
++
++  // The magnitude has a FLOOR, and that floor is the entire point of this function.
++  //
++  // Audio samples are float32 and are therefore already exactly representable, so
++  // x * (1 + delta) rounds straight back to x unless |delta * x| exceeds HALF the gap to
++  // the neighbouring float32. That gap is relative: half-spacing is at most 2^-24 of the
++  // value. So any |delta| below that threshold changes NOTHING AT ALL -- not "a few
++  // samples", not "small changes", but every sample bit-identical.
++  //
++  // The original spec was a uniform multiplier in 1.0 +/- 2e-7. Simulated over the sample
++  // distribution: |delta| below ~3e-8 moves 0.00% of samples (a COMPLETE no-op, ~15% of
++  // draws), and it is only partially effective up to ~6e-8 (80.7% of samples at 5e-8),
++  // so roughly 30% of draws are degraded or dead. Measured 2026-08-09 against a real
++  // build: a profile whose delta came out at -4.95e-09 left 0 of 44100 samples changed --
++  // no audio farbling whatsoever for that profile+domain. The injected JavaScript this
++  // replaced had the identical hole (`data[i] *= fudge` on the same Float32Array), so it
++  // shipped in every release the feature ever appeared in, unnoticed because nothing ever
++  // compared farbled audio against native audio.
++  //
++  // Flooring |delta| at 2^-23 guarantees at least a one-ULP move for every non-zero
++  // sample, with 2x margin over the worst-case half-spacing. The ceiling is unchanged, so
++  // the perturbation is never larger than the original spec permitted: 2e-7 relative is
++  // about -134 dB, far below the audible floor and below the precision fingerprinters
++  // hash at.
++  //
++  // Exact zeros stay zero -- 0 * anything is 0. Unavoidable and harmless: a silent sample
++  // carries no fingerprint entropy.
++  constexpr double kMinMagnitude = 1.1920928955078125e-07;  // 2^-23
++  constexpr double kMaxMagnitude = 2.0e-07;
++  const double magnitude =
++      kMinMagnitude + prng.NextDouble() * (kMaxMagnitude - kMinMagnitude);
++  return 1.0 + ((prng.Next() & 1u) ? magnitude : -magnitude);
 +}
 +
 +void HodosSessionCache::PerturbAudioSamples(float* samples, size_t count) {
@@ -212,10 +243,10 @@ index 0000000000000..df96e72e9f1c2
 +}  // namespace blink
 diff --git third_party/blink/renderer/core/execution_context/hodos_session_cache.h third_party/blink/renderer/core/execution_context/hodos_session_cache.h
 new file mode 100644
-index 0000000000000..291354c13c9f2
+index 0000000000000..789e3646ad153
 --- /dev/null
 +++ third_party/blink/renderer/core/execution_context/hodos_session_cache.h
-@@ -0,0 +1,175 @@
+@@ -0,0 +1,184 @@
 +// Copyright 2026 Marston Enterprises. All rights reserved.
 +// Use of this source code is governed by a BSD-style license identical to
 +// Chromium's; see the Chromium LICENSE file in the root of this tree.
@@ -334,9 +365,18 @@ index 0000000000000..291354c13c9f2
 +  void PerturbPixels(uint8_t* pixels, size_t length_in_bytes,
 +                     Stream stream = Stream::kCanvas);
 +
-+  // One multiplier per audio buffer, ~1.0 +/- 2e-7: below the audible floor and below
-+  // the precision most fingerprinters hash at, but enough to move the hash. Returns
-+  // exactly 1.0 when farbling is disabled, so callers may multiply unconditionally.
++  // One multiplier per audio buffer. |delta| is confined to [2^-23, 2e-7]: below the
++  // audible floor (~-134 dB) and below the precision fingerprinters hash at, but ALWAYS
++  // above float32 resolution so it genuinely moves the samples. Returns exactly 1.0 when
++  // farbling is disabled, so callers may multiply unconditionally.
++  //
++  // ⚠️ The lower bound is NOT tuning; see the implementation. Without it the multiply is a
++  // total no-op for ~15% of profile+domain pairs -- which is exactly how the outgoing
++  // JavaScript behaved, and why its audio farbling silently did nothing for a slice of
++  // users in every release that shipped it. This is the one place the native
++  // implementation deliberately DIVERGES from the JS it replaced, so already-enrolled
++  // users' audio fingerprint shifts once; that was accepted as the price of the value
++  // being farbled at all.
 +  double AudioFudgeFactor();
 +
 +  // Applies AudioFudgeFactor() to `count` float samples in place (C5). One factor for
