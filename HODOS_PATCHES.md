@@ -84,7 +84,7 @@ git_apply_patch_file`), preceded by a reverse-check. So:
 | `hodos_farble_session_cache` | C1 `HodosSessionCache` Supplement | C1 | `core/execution_context/build.gni` (2-line hunk) + **2 new files** `hodos_session_cache.{h,cc}` | `HODOS_FARBLING` | `94c1726` / Chromium `150.0.7871.187` | — (initial) | `115 patches total (1 applied, 114 skipped, 0 failed)` |
 | `hodos_farble_canvas2d` | C3 Canvas 2D readback farbling | C3 | `modules/canvas/canvas2d/base_rendering_context_2d.cc` (`getImageDataInternal`) + `core/html/canvas/html_canvas_element.cc` (helper + the 2 encode callers of `Snapshot`) | `HODOS_FARBLING` | `94c1726` / Chromium `150.0.7871.187` | — (initial) | ✅ compiled — symbols verified in `libcef`, Windows + macOS |
 | `hodos_farble_webgl` | C4 WebGL `readPixels` farbling | C4 | `modules/webgl/webgl_rendering_context_base.cc` (`ReadPixelsHelper`, one hook) | `HODOS_FARBLING` | `94c1726` / Chromium `150.0.7871.187` | — (initial) | ⏳ owed — needs a CEF build |
-| `hodos_farble_webaudio` | C5 WebAudio farbling | C5 | `modules/webaudio/audio_buffer.{idl,h,cc}` (`getChannelData`) + `modules/webaudio/analyser_node.cc` (`getFloatFrequencyData`) | `HODOS_FARBLING` | `94c1726` / Chromium `150.0.7871.187` | — (initial) | ⏳ owed — needs a CEF build |
+| `hodos_farble_webaudio` | C5 WebAudio farbling | C5 | `modules/webaudio/audio_buffer.{idl,h,cc}` (`getChannelData`) + `modules/webaudio/analyser_node.cc` (`getFloatFrequencyData`) | `HODOS_FARBLING` | `94c1726` / Chromium `150.0.7871.187` | — (initial) | ✅ compiled; hook proven to RUN, then found to perturb nothing until the `c63654654` delta floor — see below |
 | `hodos_farble_navigator` | C6 `deviceMemory` + `hardwareConcurrency` | C6 | `core/execution_context/navigator_base.{h,cc}` + `core/frame/navigator_device_memory.h` (one line: make virtual) | `HODOS_FARBLING` | `94c1726` / Chromium `150.0.7871.187` | — (initial) | ⏳ owed — needs a CEF build |
 
 **C4/C5/C6 were authored as ONE commit and cost ONE build per platform.** They touch disjoint files,
@@ -98,6 +98,40 @@ fast.
 > (`simple_handler.cpp :: OnBeforeBrowse`), which is exactly where Q3 §2.1 says the decision belongs.
 > C7 therefore needs no Chromium patch and no CEF rebuild; what remains under that label is
 > shell-side teardown of the legacy JS seed path.
+
+### ⛔ C5 — the audio delta has a FLOOR, and removing it silently disables audio farbling
+
+Landed as a follow-up commit (`c63654654`) after the first C4/C5/C6 build, because measurement
+caught what review had not.
+
+Audio samples are float32 and therefore already exactly representable, so `x * (1 + delta)` rounds
+straight back to `x` unless `|delta * x|` exceeds **half** the gap to the neighbouring float32 — a
+relative threshold of at most `2^-24`. A delta under that changes **nothing**: not a few samples,
+every sample, bit for bit.
+
+The original spec (uniform `1.0 ± 2e-7`, inherited from the injected JavaScript) lands under that
+threshold often. Simulated over the sample distribution: `|delta| < ~3e-8` moves **0.00%** of samples
+(~15% of draws are a complete no-op) and it is only partially effective to ~6e-8 (80.7% at 5e-8) —
+so ~30% of draws are dead or degraded. Measured on a real build: a profile whose delta came out at
+`-4.95e-09` left **0 of 44100** samples changed, with 5000 non-zero samples and peak 0.70 in the
+window, so not silence.
+
+**The JavaScript had the identical hole** (`data[i] *= fudge` on the same `Float32Array`), so audio
+farbling has silently done nothing for a slice of users in every release that ever shipped it. It
+survived because nothing compared farbled audio against **native** audio — comparing farbled against
+exempt inside one session looks correct when both are native.
+
+`|delta|` is now confined to `[2^-23, 2e-7]`. The floor is one full ULP (2× margin over worst-case
+half-spacing), verified by simulation to move 100% of non-zero samples across the whole band; the
+ceiling is unchanged, so it is never larger than the original spec permitted (~-134 dB). **Do not
+"restore the original constant" on a rebase** — that constant is the bug.
+
+> **The diagnostic technique is worth keeping.** C5 farbles only the bindings-facing
+> `getChannelData`; `copyFromChannel` uses the context-free overload we leave native. So on ONE page
+> with ONE seed, reading `copyFromChannel` **first** and `getChannelData` second gives a
+> native-vs-farbled comparison with no exempt page, no second profile and no restart. Order matters:
+> `getChannelData` perturbs the buffer's own storage, so reading it first makes the two agree for the
+> wrong reason.
 
 ### C4/C5/C6 — the things a rebase must not "simplify"
 
