@@ -45,9 +45,19 @@ class CefBrowserFrame : public CefFrameServiceBase<cef::mojom::BrowserFrame> {
   // hodos::FarblingRegistry. Answers from browser-process state only -- it does not
   // touch the CefFrameHostImpl association, so it is safe to service before
   // FrameAttached has been acked, which is precisely when the renderer needs it.
+  //
+  // |host| is ADVISORY. Since P4e the answer is keyed on the TOP frame's host as
+  // resolved here in the browser (see ResolveTopFrameHost), because a subframe must
+  // receive its top frame's key and a renderer must not be trusted about who frames
+  // it. |host| is compared against the resolved value for logging only.
   void GetHodosFarblingKey(
       const std::string& host,
       cef::mojom::BrowserFrame::GetHodosFarblingKeyCallback callback) override;
+
+  // Hodos P4e: the registrable-domain lookup key for THIS frame -- always the host of
+  // the outermost main frame, never the frame's own. Returns an empty string when there
+  // is no first party to key on, which the caller must treat as "do not farble".
+  std::string ResolveTopFrameHost() const;
 
   CefRefPtr<CefFrameHostImpl> GetFrameHost(bool prefer_speculative,
                                            bool* is_excluded = nullptr) const;

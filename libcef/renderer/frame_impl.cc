@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstdio>
+#include <map>
 
 #include "build/build_config.h"
 
@@ -20,9 +21,11 @@
 #endif
 #endif
 
+#include "base/no_destructor.h"
 #include "base/strings/string_number_conversions.h"
 #include "base/strings/stringprintf.h"
 #include "base/strings/utf_string_conversions.h"
+#include "base/unguessable_token.h"
 #include "cef/include/cef_urlrequest.h"
 #include "cef/libcef/common/app_manager.h"
 #include "cef/libcef/common/frame_util.h"
@@ -45,6 +48,7 @@
 #include "third_party/blink/public/web/blink.h"
 #include "third_party/blink/public/web/web_document.h"
 #include "third_party/blink/public/web/web_document_loader.h"
+#include "third_party/blink/public/web/web_frame.h"
 #include "third_party/blink/public/web/web_frame_content_dumper.h"
 #include "third_party/blink/public/web/web_local_frame.h"
 #include "third_party/blink/public/web/web_navigation_control.h"
@@ -57,6 +61,16 @@ namespace {
 // Hodos C2: browser -> renderer farbling key. Consumed inside libcef and never
 // surfaced to the client; see CefFrameImpl::SendMessage.
 constexpr char kHodosFarblingKeyMessage[] = "hodos_farble_key";
+
+// Hodos P4e: one renderer-process-wide memo entry, keyed by the top frame's token.
+// |has_key| false is a real, memoisable answer ("the browser has nothing for this top
+// frame"), NOT an error -- errors are deliberately never memoised, so a dropped pipe
+// cannot silently unfarble a whole document's worth of frames.
+struct HodosFarblingMemoEntry {
+  bool has_key = false;
+  bool enabled = false;
+  std::array<uint8_t, 32> key{};
+};
 
 // Maximum number of times to retry the browser connection.
 constexpr size_t kConnectionRetryMaxCt = 3U;
@@ -489,38 +503,112 @@ void CefFrameImpl::MaybeApplyHodosFarblingKey() {
     return;
   }
 
-  // Main frame only, matching the shell, which sends the key for IsMain() frames.
-  // Subframes and workers are P4e's scope and have no entry to find; skipping them
-  // also keeps this to ONE sync browser round-trip per top-level document rather
-  // than one per frame on an iframe-heavy page.
-  if (frame_->Parent() != nullptr) {
-    return;
+  const bool is_main_frame = (frame_->Parent() == nullptr);
+
+  // P4e: SUBFRAMES ARE IN SCOPE. The old `if (Parent() != nullptr) return;` here made
+  // every subframe -- same-origin ones included -- fail closed to native values, which
+  // is a BYPASS and not merely a coverage gap: a same-origin child frame is fully
+  // scriptable from its parent, so three lines of JS read the machine's real canvas /
+  // WebGL / audio / navigator out of an about:blank iframe on the very page farbling is
+  // supposed to protect. Measured on macOS (f910e19) and again on Windows 2026-08-13.
+  //
+  // The browser now answers every frame with its TOP frame's key (see
+  // CefBrowserFrame::ResolveTopFrameHost), so a subframe has an entry to find and the
+  // exemption bit is inherited from the top frame for free.
+
+  // --- memo -------------------------------------------------------------------------
+  //
+  // ⛔ THIS IS A SAFETY MECHANISM, NOT AN OPTIMISATION, and it must not be removed as
+  // "premature". A subframe's OnContextCreated fires INSIDE the parent's JS call stack
+  // when the iframe is appended synchronously, so without a memo
+  //
+  //     for (let i = 0; i < 10000; i++) document.body.appendChild(document.createElement('iframe'));
+  //
+  // becomes 10,000 BLOCKING browser round-trips on the renderer main thread -- roughly a
+  // second and a half of jank that the page fully controls. Page-controlled amplification
+  // of a blocking IPC is an availability bug. Keyed by the top frame's token, every frame
+  // sharing a top document costs exactly one round trip.
+  //
+  // ⚠️ INVALIDATION IS EXPLICIT AND MUST STAY THAT WAY. It is tempting to rely on the
+  // token changing per document -- RenderDocument is enabled by default at the
+  // `all-frames` level on Chromium 150, so each navigation does get a fresh
+  // RenderFrameHost and hence a fresh token. But that is a FeatureParam default, not an
+  // invariant: a field trial or --disable-features flips it, the top frame then reuses
+  // its LocalFrame across a same-site navigation, and the memo would serve the PREVIOUS
+  // document's verdict -- i.e. a Privacy Shield toggle silently fails to take effect.
+  // So a main frame drops its own entry before pulling, which is safe because the top
+  // frame's OnContextCreated always precedes its subframes'.
+  //
+  // ⚠️ Renderer `Top()` and browser `GetOutermostMainFrame()` partition differently for
+  // fenced frames: Top() stops at the fenced root, the browser escapes it. That can only
+  // make the memo key FINER than the answer's partition, costing an extra round trip and
+  // never yielding a wrong key. The dangerous direction -- a coarser key than the answer
+  // -- is impossible. Do not "simplify" this to the browser's notion of top.
+  static base::NoDestructor<std::map<base::UnguessableToken, HodosFarblingMemoEntry>>
+      memo;
+  // Bounded so a session that visits many top documents in one renderer cannot grow it
+  // without limit. Clearing wholesale rather than evicting one entry is deliberate: the
+  // only cost of a miss is one round trip, so the simplest correct policy wins.
+  constexpr size_t kMemoMaxEntries = 32;
+
+  blink::WebFrame* top_frame = frame_->Top();
+  const base::UnguessableToken memo_key =
+      top_frame ? top_frame->GetFrameToken().value() : base::UnguessableToken();
+
+  if (is_main_frame) {
+    // ⚠️ The erase happens BEFORE the main-frame URL gating below, deliberately. If it
+    // sat after, a main frame navigating from a keyed site to internal UI would take an
+    // early return without invalidating, and (when frame tokens are reused, i.e.
+    // RenderDocument below `all-frames`) its subframes would then be served the PREVIOUS
+    // document's key. Invalidating first is free -- the only cost of an unnecessary
+    // erase is one round trip.
+    memo->erase(memo_key);
+  } else {
+    auto it = memo->find(memo_key);
+    if (it != memo->end()) {
+      if (!it->second.has_key) {
+        return;  // memoised "no key" -- fail closed, no IPC.
+      }
+      blink_glue::SetHodosFarblingKey(frame_, it->second.key.data(),
+                                      it->second.enabled);
+      return;
+    }
   }
 
-  // Only real web content has a first party to key on. This is also what keeps the
-  // sync IPC off about:blank, the initial empty document, devtools:// and our own
-  // internal UI -- all of which would miss anyway.
   const GURL url = frame_->GetDocument().Url();
-  if (!url.SchemeIsHTTPOrHTTPS()) {
-    return;
-  }
-  // Parenthesised, not `=`: GURL::host() returns std::string_view on Chromium 150,
-  // and std::string's string_view constructor is explicit, so copy-initialisation
-  // does not compile. We need an owning std::string anyway to pass by const ref.
-  const std::string host(url.host());
-  if (host.empty()) {
-    return;
-  }
+  std::string host;
 
-  // Skip our own UI. Hodos serves the header and every overlay from
-  // http://127.0.0.1:5137, which IS http, so without this gate each of those
-  // ~15 documents would fire a BLOCKING sync round-trip at startup only to be
-  // told there is no key -- straight onto the first-paint critical path. The
-  // shell never files an entry for these hosts either, so the answer is always
-  // "nothing"; not asking is both faster and semantically right, since internal
-  // UI is never farbled.
-  if (host == "127.0.0.1" || host == "localhost" || host == "[::1]") {
-    return;
+  if (is_main_frame) {
+    // Main-frame fast paths, kept EXACTLY as they were so that this change cannot
+    // regress startup. Hodos serves the header and ~15 overlays from
+    // http://127.0.0.1:5137; each is a main frame, and each would otherwise fire a
+    // BLOCKING sync round-trip on the first-paint critical path only to be told there
+    // is no key. The shell never files an entry for those hosts, so not asking is both
+    // faster and semantically right -- internal UI is never farbled.
+    if (url.SchemeIsHTTPOrHTTPS()) {
+      // Parenthesised, not `=`: GURL::host() returns std::string_view on Chromium 150,
+      // and std::string's string_view constructor is explicit, so copy-initialisation
+      // does not compile. We need an owning std::string anyway to pass by const ref.
+      host = std::string(url.host());
+      if (host.empty()) {
+        return;
+      }
+      if (host == "127.0.0.1" || host == "localhost" || host == "[::1]") {
+        return;
+      }
+    } else if (frame_->Opener() == nullptr) {
+      // A non-HTTP(S) main frame with no opener is the initial empty document of a
+      // fresh tab, devtools://, or a file:// page. Nothing to key on.
+      //
+      // ⛔ The `Opener()` clause is load-bearing, not defensive tidiness. `window.open()`
+      // yields a main frame sitting on about:blank that INHERITS the opener's origin and
+      // is scriptable from it -- the same bypass in a different container. Drop this
+      // clause and the popup vector survives the fix while every iframe test goes green.
+      // Measured live on Windows 2026-08-13: popup child == native on all five fields.
+      return;
+    }
+    // else: origin-inheriting main frame WITH an opener -- fall through and pull. The
+    // browser walks the opener chain to find the real first party.
   }
 
   // Bind if needed but do not disturb the connection state machine: pass the
@@ -538,14 +626,24 @@ void CefFrameImpl::MaybeApplyHodosFarblingKey() {
 
   std::string key_hex;
   bool enabled = false;
+  // |host| is advisory and is empty for subframes; the browser keys on the top frame it
+  // resolves for itself. It is still sent so the browser can log a main-frame mismatch.
   if (!browser_frame->GetHodosFarblingKey(host, &key_hex, &enabled)) {
-    // Sync call failed outright (pipe error / browser going away).
+    // Sync call failed outright (pipe error / browser going away). Do NOT memoise a
+    // transport failure as "no key" -- that would turn one dropped pipe into a whole
+    // top document's worth of silently unfarbled frames.
     return;
   }
 
+  if (memo->size() >= kMemoMaxEntries) {
+    memo->clear();
+  }
+
   if (key_hex.empty()) {
-    // A definite "the browser has nothing for this host". Distinct from a failure,
-    // and handled identically on purpose.
+    // A definite "the browser has nothing for this top frame". Distinct from a failure,
+    // and handled identically on purpose -- but memoisable, unlike a failure, so the
+    // subframes of an unkeyed page cost one round trip between them rather than one each.
+    (*memo)[memo_key] = HodosFarblingMemoEntry{};
     return;
   }
 
@@ -553,6 +651,7 @@ void CefFrameImpl::MaybeApplyHodosFarblingKey() {
   if (key_hex.size() != key.size() * 2) {
     LOG(WARNING) << "Hodos: farbling key wrong length; not farbling "
                  << frame_debug_str_;
+    (*memo)[memo_key] = HodosFarblingMemoEntry{};
     return;
   }
   for (size_t i = 0; i < key.size(); ++i) {
@@ -562,10 +661,17 @@ void CefFrameImpl::MaybeApplyHodosFarblingKey() {
       // half-random key is not a weaker secret, it is a different fingerprint.
       LOG(WARNING) << "Hodos: farbling key not valid hex; not farbling "
                    << frame_debug_str_;
+      (*memo)[memo_key] = HodosFarblingMemoEntry{};
       return;
     }
     key[i] = static_cast<uint8_t>(byte);
   }
+
+  HodosFarblingMemoEntry entry;
+  entry.has_key = true;
+  entry.enabled = enabled;
+  entry.key = key;
+  (*memo)[memo_key] = entry;
 
   blink_glue::SetHodosFarblingKey(frame_, key.data(), enabled);
 }
