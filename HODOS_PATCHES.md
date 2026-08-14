@@ -86,6 +86,8 @@ git_apply_patch_file`), preceded by a reverse-check. So:
 | `hodos_farble_webgl` | C4 WebGL `readPixels` farbling | C4 | `modules/webgl/webgl_rendering_context_base.cc` (`ReadPixelsHelper`, one hook) | `HODOS_FARBLING` | `94c1726` / Chromium `150.0.7871.187` | — (initial) | ⏳ owed — needs a CEF build |
 | `hodos_farble_webaudio` | C5 WebAudio farbling | C5 | `modules/webaudio/audio_buffer.{idl,h,cc}` (`getChannelData`) + `modules/webaudio/analyser_node.cc` (`getFloatFrequencyData`) | `HODOS_FARBLING` | `94c1726` / Chromium `150.0.7871.187` | — (initial) | ✅ compiled; hook proven to RUN, then found to perturb nothing until the `c63654654` delta floor — see below |
 | `hodos_farble_navigator` | C6 `deviceMemory` + `hardwareConcurrency` | C6 | `core/execution_context/navigator_base.{h,cc}` + `core/frame/navigator_device_memory.h` (one line: make virtual) | `HODOS_FARBLING` | `94c1726` / Chromium `150.0.7871.187` | — (initial) | ⏳ owed — needs a CEF build |
+| `hodos_farble_offscreen_canvas` | **P4f** `OffscreenCanvas.convertToBlob` | P4f/E3 | `core/offscreencanvas/offscreen_canvas.cc` (one hook in `convertToBlob`) | `HODOS_FARBLING` | `94c1726` / Chromium `150.0.7871.187` | — (initial) | ✅ compiles (incremental, 2026-08-14) |
+| `hodos_farble_worker_key` | **P4f** dedicated + nested worker key inheritance | P4f/E2 | `core/workers/global_scope_creation_params.h` (3 defaulted fields) + `core/workers/dedicated_worker.cc` (producer) + `core/workers/dedicated_worker_global_scope.{h,cc}` (carrier + installer) | `HODOS_FARBLING` | `94c1726` / Chromium `150.0.7871.187` | — (initial) | ✅ compiles (incremental, 2026-08-14) |
 
 **C4/C5/C6 were authored as ONE commit and cost ONE build per platform.** They touch disjoint files,
 depend only on C1, and have no ordering relationship with one another, so four separate ~5 h builds
@@ -98,6 +100,48 @@ fast.
 > (`simple_handler.cpp :: OnBeforeBrowse`), which is exactly where Q3 §2.1 says the decision belongs.
 > C7 therefore needs no Chromium patch and no CEF rebuild; what remains under that label is
 > shell-side teardown of the legacy JS seed path.
+
+### ⛔ P4f — the byte analyser paths CANNOT use the audio multiplier, and this is the C5 bug again
+
+Landed 2026-08-14, in the same batch as the worker key and `convertToBlob`. Written down here
+because the wrong version of this fix is the *obvious* one and it would survive review.
+
+`AnalyserNode::getByteFrequencyData` and `getByteTimeDomainData` hand back `Uint8Array` — values
+already quantised to `[0, 255]` by `RealtimeAnalyser` (`static_cast<unsigned char>(ClampTo(...))`).
+Our audio perturbation is `x * (1 ± δ)` with `δ ∈ [2⁻²³, 2e-7]`. On an integer that small:
+
+```
+b * (1 + δ)   ->  NEVER moves the byte  (b would have to exceed 5,000,000)
+b * (1 - δ)   ->  ALWAYS drops it by 1  (the store truncates toward zero)
+```
+
+and the sign is **one bit, fixed per profile+domain for the whole session**. So a byte-domain
+multiply is not a small perturbation; it is a coin flip between **bit-identical to native** (~50% of
+profile+domain pairs — no protection whatsoever) and **every non-zero byte minus exactly one** (~50%
+— a uniform, structure-preserving shift that a fingerprinter inverts with a subtraction, because the
+spectrum's whole shape survives it).
+
+⇒ they use `HodosSessionCache::PerturbBytes` — a keyed low-bit flip on ~3% of entries, the same
+construction `PerturbPixels` already uses on the other quantised surface we farble. Each byte
+endpoint gets its **own** `Stream`, because a page can read both arrays side by side.
+
+`getFloatTimeDomainData` is float32 in the same nominal `[-1, 1]` domain as `getChannelData`, so it
+keeps `PerturbAudioSamples` — the multiplier is correct *there*.
+
+**Do not "unify these three onto one helper" on a rebase.** They are three endpoints in two domains,
+and the unification is precisely the defect.
+
+### ⚠️ P4f — `HodosFarbleSnapshot` moved out of `html_canvas_element.cc`
+
+It was an anonymous-namespace helper in C3. `OffscreenCanvas::convertToBlob` needs the identical
+readback, so it now lives in `hodos_session_cache.{h,cc}` (`CORE_EXPORT`, already in
+`core/execution_context/build.gni`, so no new build-file entry). C3's call sites are unchanged; only
+the definition moved, and the four Skia/bitmap includes it needed went with it.
+
+**Do not re-copy it into a second translation unit.** The "the farbled image must be a COPY" argument
+is subtle — a shared backing store plus a deterministic perturbation means a second read *undoes* the
+first — and two divergent copies of that reasoning is how this project already shipped an audio no-op
+twice over.
 
 ### ⛔ C5 — the audio delta has a FLOOR, and removing it silently disables audio farbling
 

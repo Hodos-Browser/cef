@@ -13,10 +13,10 @@ index a158629b41b26..e904c1930ac07 100644
    "remote_security_context.cc",
 diff --git third_party/blink/renderer/core/execution_context/hodos_session_cache.cc third_party/blink/renderer/core/execution_context/hodos_session_cache.cc
 new file mode 100644
-index 0000000000000..a62d64210dbd4
+index 0000000000000..fbcfef79002c1
 --- /dev/null
 +++ third_party/blink/renderer/core/execution_context/hodos_session_cache.cc
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,304 @@
 +// Copyright 2026 Marston Enterprises. All rights reserved.
 +// Use of this source code is governed by a BSD-style license identical to
 +// Chromium's; see the Chromium LICENSE file in the root of this tree.
@@ -28,6 +28,10 @@ index 0000000000000..a62d64210dbd4
 +#include <iterator>
 +
 +#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/platform/graphics/unaccelerated_static_bitmap_image.h"
++#include "third_party/skia/include/core/SkData.h"
++#include "third_party/skia/include/core/SkImage.h"
++#include "third_party/skia/include/core/SkImageInfo.h"
 +
 +namespace blink {
 +
@@ -160,6 +164,21 @@ index 0000000000000..a62d64210dbd4
 +  }
 +}
 +
++void HodosSessionCache::PerturbBytes(uint8_t* bytes, size_t count, Stream stream) {
++  if (!FarblingEnabled() || !bytes) {
++    return;
++  }
++  HodosPrng prng = MakePrng(stream);
++  // Same 3% rate and same low-bit flip as PerturbPixels, but every element is a
++  // candidate: this data is a flat run of quantised values, not RGBA quads, so there
++  // is no channel to step to. See the header for why a multiply is unusable here.
++  for (size_t i = 0; i < count; ++i) {
++    if (prng.NextDouble() < 0.03) {
++      bytes[i] ^= 1u;
++    }
++  }
++}
++
 +double HodosSessionCache::AudioFudgeFactor() {
 +  if (!FarblingEnabled()) {
 +    return 1.0;
@@ -240,13 +259,74 @@ index 0000000000000..a62d64210dbd4
 +  Supplement<ExecutionContext>::Trace(visitor);
 +}
 +
++// ---------------------------------------------------------------------------
++// HodosFarbleSnapshot -- shared by HTMLCanvasElement's two encode callers
++// (toDataURL, toBlob) and by OffscreenCanvas::convertToBlob. See the header for
++// why the result must be a copy, and why the size gate is NOT here.
++// ---------------------------------------------------------------------------
++scoped_refptr<StaticBitmapImage> HodosFarbleSnapshot(
++    ExecutionContext* execution_context,
++    scoped_refptr<StaticBitmapImage> snapshot) {
++  if (!execution_context || !snapshot) {
++    return snapshot;
++  }
++  HodosSessionCache& cache = HodosSessionCache::From(*execution_context);
++  if (!cache.FarblingEnabled()) {
++    return snapshot;
++  }
++
++  auto paint_image = snapshot->PaintImageForCurrentFrame();
++  if (!paint_image) {
++    return snapshot;
++  }
++  const SkImageInfo source_info = paint_image.GetSkImageInfo();
++  if (source_info.isEmpty()) {
++    return snapshot;
++  }
++
++  // Read back into a canonical unpremultiplied RGBA8888 buffer.
++  //   * RGBA8888 so that PerturbPixels's "low bit of byte 0" is literally the red
++  //     channel whatever the source's native byte order is, and so a float-storage
++  //     (HDR) canvas is CONVERTED rather than reinterpreted as bytes.
++  //   * Unpremultiplied because that is what the image encoders want and what
++  //     ImageDataBuffer converts to anyway for every accelerated canvas
++  //     (image_data_buffer.cc does this same readPixels for exactly that reason).
++  //     It also keeps the perturbation from producing an invalid premultiplied
++  //     pixel where red could exceed alpha.
++  const SkImageInfo info =
++      SkImageInfo::Make(source_info.width(), source_info.height(),
++                        kRGBA_8888_SkColorType, kUnpremul_SkAlphaType,
++                        source_info.refColorSpace());
++  const size_t row_bytes = info.minRowBytes();
++  const size_t size = info.computeByteSize(row_bytes);
++  if (SkImageInfo::ByteSizeOverflowed(size) || size == 0) {
++    return snapshot;
++  }
++
++  sk_sp<SkData> pixels = SkData::MakeUninitialized(size);
++  if (!paint_image.readPixels(info, pixels->writable_data(), row_bytes, 0, 0)) {
++    return snapshot;
++  }
++  cache.PerturbPixels(static_cast<uint8_t*>(pixels->writable_data()), size);
++
++  sk_sp<SkImage> farbled =
++      SkImages::RasterFromData(info, std::move(pixels), row_bytes);
++  if (!farbled) {
++    return snapshot;
++  }
++  // Unpremultiplied raster means ImageDataBuffer takes its peekPixels path over
++  // OUR private buffer -- no second GPU readback, and nothing else can observe it.
++  return UnacceleratedStaticBitmapImage::Create(std::move(farbled),
++                                                snapshot->Orientation());
++}
++
 +}  // namespace blink
 diff --git third_party/blink/renderer/core/execution_context/hodos_session_cache.h third_party/blink/renderer/core/execution_context/hodos_session_cache.h
 new file mode 100644
-index 0000000000000..789e3646ad153
+index 0000000000000..931893c589e84
 --- /dev/null
 +++ third_party/blink/renderer/core/execution_context/hodos_session_cache.h
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,254 @@
 +// Copyright 2026 Marston Enterprises. All rights reserved.
 +// Use of this source code is governed by a BSD-style license identical to
 +// Chromium's; see the Chromium LICENSE file in the root of this tree.
@@ -268,7 +348,9 @@ index 0000000000000..789e3646ad153
 +
 +#include "third_party/blink/renderer/core/core_export.h"
 +#include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
 +#include "third_party/blink/renderer/platform/supplementable.h"
++#include "third_party/blink/renderer/platform/wtf/casting.h"
 +
 +namespace blink {
 +
@@ -351,7 +433,22 @@ index 0000000000000..789e3646ad153
 +    kAudio = 3,
 +    kDeviceMemory = 4,
 +    kHardwareConcurrency = 5,
++    // P4f. The two byte-valued analyser readers get their own streams, and NOT
++    // kAudio, for the reason this enum exists: they are separate surfaces a site can
++    // read side by side, and a shared stream would let it correlate them.
++    kAnalyserByteFrequency = 6,
++    kAnalyserByteTimeDomain = 7,
 +  };
++
++  // The 32-byte per-origin key, for the one caller that must MOVE it rather than
++  // use it: dedicated-worker creation copies it into GlobalScopeCreationParams so
++  // the worker's own ExecutionContext can be seeded from its parent's.
++  //
++  // ⚠️ Only meaningful when HasOriginKey() is true. A caller that copies this
++  // without also copying has_key would hand a worker a ZERO key and mark it
++  // valid -- every user farbled identically, which is the shipped constant-seed
++  // bug reintroduced and is strictly worse than not farbling at all.
++  const std::array<uint8_t, 32>& DomainKey() const { return domain_key_; }
 +
 +  HodosPrng MakePrng(Stream stream) const;
 +
@@ -364,6 +461,34 @@ index 0000000000000..789e3646ad153
 +  // site, because only the caller knows the surface's dimensions.
 +  void PerturbPixels(uint8_t* pixels, size_t length_in_bytes,
 +                     Stream stream = Stream::kCanvas);
++
++  // P4f. Perturbs a run of ALREADY-QUANTISED bytes by flipping the low bit of ~3% of
++  // them. Every element is a candidate (unlike PerturbPixels, which steps by 4 to
++  // reach one channel of an RGBA quad).
++  //
++  // ⛔ THIS EXISTS BECAUSE THE AUDIO MULTIPLIER CANNOT BE USED ON BYTES, and the
++  // reason is the C5 defect one type-width along. AudioFudgeFactor returns
++  // 1 ± δ with δ ∈ [2^-23, 2e-7]. Applied to an integer b in [0, 255]:
++  //
++  //     b * (1 + δ)  -> NEVER changes the byte. b would have to exceed 5,000,000
++  //                     before the product reached b+1.
++  //     b * (1 - δ)  -> ALWAYS drops it by exactly 1, because the store truncates
++  //                     toward zero.
++  //
++  // and the sign is ONE BIT, fixed per profile+domain for the whole session. So a
++  // byte-domain multiply is not "a small perturbation"; it is a coin flip between
++  // bit-identical-to-native (~50% of profile+domain pairs -- no protection at all)
++  // and subtracting exactly 1 from every non-zero byte (~50% -- a uniform,
++  // structure-preserving shift that a fingerprinter inverts with a subtraction,
++  // since the spectrum's entire shape survives it).
++  //
++  // A low-bit flip on a random subset has neither failure mode: it always moves the
++  // elements it selects, and the selection is keyed, so there is no constant to undo.
++  // It is the same construction PerturbPixels uses on the other quantised surface we
++  // farble, which is the point -- quantised data has one correct treatment here.
++  //
++  // No-op when farbling is disabled.
++  void PerturbBytes(uint8_t* bytes, size_t count, Stream stream);
 +
 +  // One multiplier per audio buffer. |delta| is confined to [2^-23, 2e-7]: below the
 +  // audible floor (~-134 dB) and below the precision fingerprinters hash at, but ALWAYS
@@ -427,6 +552,31 @@ index 0000000000000..789e3646ad153
 +  bool has_key_ = false;
 +  bool farbling_enabled_ = false;
 +};
++
++// Returns a farbled COPY of `snapshot`, or `snapshot` itself when farbling is off for
++// `execution_context` (no key, auth-domain exemption, or the user's per-site Privacy
++// Shield toggle -- the browser collapses all three into one bit and the renderer does
++// not re-decide).
++//
++// IT MUST BE A COPY, and that is correctness rather than hygiene. A snapshot can share
++// pixels with the canvas's own backing store, and because PerturbPixels is
++// deterministic, a second read of an already-perturbed canvas re-flips exactly the same
++// bits and silently UNDOES the first farble. Copying leaves the canvas pristine, so
++// every read returns the same farbled bytes -- the intra-session consistency the whole
++// scheme depends on, since an unstable fingerprint is itself a fingerprint.
++//
++// ⚠️ The small-canvas gate (`w * h < 65536`) is deliberately NOT here. It lives at each
++// call site, because only the caller knows the surface's dimensions -- same division of
++// labour as PerturbPixels.
++//
++// P4f moved this out of an anonymous namespace in html_canvas_element.cc so that
++// OffscreenCanvas::convertToBlob could share it. Do NOT re-copy it into a second
++// translation unit: the "must be a copy" reasoning above is subtle enough that two
++// divergent versions of it is a defect waiting to happen, and this project has already
++// paid for that once with the duplicated audio no-op.
++CORE_EXPORT scoped_refptr<StaticBitmapImage> HodosFarbleSnapshot(
++    ExecutionContext* execution_context,
++    scoped_refptr<StaticBitmapImage> snapshot);
 +
 +}  // namespace blink
 +

@@ -1,0 +1,170 @@
+diff --git third_party/blink/renderer/core/workers/dedicated_worker.cc third_party/blink/renderer/core/workers/dedicated_worker.cc
+index 7ea6daec53a49..0c05ccac490ff 100644
+--- third_party/blink/renderer/core/workers/dedicated_worker.cc
++++ third_party/blink/renderer/core/workers/dedicated_worker.cc
+@@ -30,6 +30,7 @@
+ #include "third_party/blink/renderer/core/event_target_names.h"
+ #include "third_party/blink/renderer/core/events/message_event.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/core/execution_context/hodos_session_cache.h"
+ #include "third_party/blink/renderer/core/fetch/request.h"
+ #include "third_party/blink/renderer/core/fileapi/public_url_manager.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+@@ -632,6 +633,39 @@ DedicatedWorker::CreateGlobalScopeCreationParams(
+       origin_ ? origin_->IsolatedCopy() : nullptr,
+       std::move(coep_reporting_observer), std::move(dip_reporting_observer));
+   params->dedicated_worker_start_time = start_time_;
++
++  // --- Hodos farbling (P4f) --------------------------------------------------
++  // Carry the parent's per-origin farbling material into the worker, so a worker
++  // farbles exactly as the context that created it does.
++  //
++  // This runs on the PARENT THREAD, and `execution_context` is whichever context
++  // called `new Worker()`. That single fact is what makes every case fall out
++  // without a special case for any of them:
++  //
++  //   * window -> worker      the parent is the keyed LocalDOMWindow (R7);
++  //   * worker -> worker      the branch above already handles a WorkerGlobalScope
++  //                           parent, and that parent was itself seeded this way, so
++  //                           nesting propagates transitively at any depth (R8);
++  //   * iframe -> worker      post-P4e a subframe's own window holds the TOP frame's
++  //                           key, so its workers inherit the top frame's key with no
++  //                           extra plumbing -- which is the correct model, not a
++  //                           happy accident;
++  //   * exempt top frame      has_key=true, enabled=false propagates, so the worker is
++  //                           exempt too and D5 inheritance stays coherent;
++  //   * internal UI / unkeyed has_key=false propagates and the worker fails closed.
++  //
++  // ⛔ FAIL CLOSED: copy the key ONLY when the parent actually has one. Never
++  // synthesise a default. See GlobalScopeCreationParams for why a zero key marked
++  // valid is worse than no farbling at all.
++  {
++    HodosSessionCache& cache = HodosSessionCache::From(*execution_context);
++    if (cache.HasOriginKey()) {
++      params->hodos_farbling_key = cache.DomainKey();
++      params->hodos_farbling_has_key = true;
++      params->hodos_farbling_enabled = cache.FarblingEnabled();
++    }
++  }
++
+   return params;
+ }
+ 
+diff --git third_party/blink/renderer/core/workers/dedicated_worker_global_scope.cc third_party/blink/renderer/core/workers/dedicated_worker_global_scope.cc
+index 532de91e556fb..b7baa1d17a400 100644
+--- third_party/blink/renderer/core/workers/dedicated_worker_global_scope.cc
++++ third_party/blink/renderer/core/workers/dedicated_worker_global_scope.cc
+@@ -49,6 +49,7 @@
+ #include "third_party/blink/renderer/core/event_target_names.h"
+ #include "third_party/blink/renderer/core/execution_context/agent.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/core/execution_context/hodos_session_cache.h"
+ #include "third_party/blink/renderer/core/execution_context/security_context_init.h"
+ #include "third_party/blink/renderer/core/frame/csp/content_security_policy.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+@@ -146,6 +147,14 @@ DedicatedWorkerGlobalScope::ParseCreationParams(
+       creation_params->parent_is_isolated_context;
+   parsed_creation_params.direct_sockets_force_enabled_in_parent =
+       creation_params->direct_sockets_force_enabled_in_parent;
++  // Hodos farbling (P4f). Copied verbatim, including has_key -- never reconstructed
++  // from the key's contents. "The key is all zeroes" and "there is no key" must stay
++  // distinguishable, because treating the former as valid is the constant-seed bug.
++  parsed_creation_params.hodos_farbling_key = creation_params->hodos_farbling_key;
++  parsed_creation_params.hodos_farbling_has_key =
++      creation_params->hodos_farbling_has_key;
++  parsed_creation_params.hodos_farbling_enabled =
++      creation_params->hodos_farbling_enabled;
+ 
+   parsed_creation_params.creation_params = std::move(creation_params);
+   return parsed_creation_params;
+@@ -210,6 +219,22 @@ DedicatedWorkerGlobalScope::DedicatedWorkerGlobalScope(
+     GetRuntimeFeatureStateOverrideContext()->SetDirectSocketsForceEnabled();
+   }
+ 
++  // --- Hodos farbling (P4f) --------------------------------------------------
++  // Install the parent's key on THIS global scope, before any worker script runs.
++  //
++  // A DedicatedWorkerGlobalScope is its own ExecutionContext, so it gets its own
++  // HodosSessionCache Supplement -- which, unseeded, is key-less and therefore
++  // reports FarblingEnabled() == false and returns native values from every patched
++  // API. That is precisely the measured R7/R8 bypass this closes.
++  //
++  // ⛔ FAIL CLOSED: no key means we install NOTHING, leaving the fresh Supplement in
++  // its native-passthrough state. Do not "helpfully" seed a default.
++  if (parsed_creation_params.hodos_farbling_has_key) {
++    HodosSessionCache::From(*this).SetOriginKey(
++        parsed_creation_params.hodos_farbling_key,
++        parsed_creation_params.hodos_farbling_enabled);
++  }
++
+   // Dedicated workers don't need to pause after script fetch.
+   ReadyToRunWorkerScript();
+   // Inherit the outside's enabled origin trial features.
+diff --git third_party/blink/renderer/core/workers/dedicated_worker_global_scope.h third_party/blink/renderer/core/workers/dedicated_worker_global_scope.h
+index ee82e8c8c3654..954648eee80e6 100644
+--- third_party/blink/renderer/core/workers/dedicated_worker_global_scope.h
++++ third_party/blink/renderer/core/workers/dedicated_worker_global_scope.h
+@@ -31,6 +31,8 @@
+ #ifndef THIRD_PARTY_BLINK_RENDERER_CORE_WORKERS_DEDICATED_WORKER_GLOBAL_SCOPE_H_
+ #define THIRD_PARTY_BLINK_RENDERER_CORE_WORKERS_DEDICATED_WORKER_GLOBAL_SCOPE_H_
+ 
++#include <array>
++#include <cstdint>
+ #include <memory>
+ 
+ #include "base/types/pass_key.h"
+@@ -187,6 +189,12 @@ class CORE_EXPORT DedicatedWorkerGlobalScope final : public WorkerGlobalScope {
+     net::StorageAccessApiStatus parent_storage_access_api_status;
+     bool parent_is_isolated_context = false;
+     bool direct_sockets_force_enabled_in_parent = false;
++    // Hodos farbling (P4f). Lifted out for exactly the reason this struct exists:
++    // creation_params is moved into WorkerGlobalScope before our constructor body
++    // runs, so anything read after the move is already gone.
++    std::array<uint8_t, 32> hodos_farbling_key{};
++    bool hodos_farbling_has_key = false;
++    bool hodos_farbling_enabled = false;
+   };
+ 
+   static ParsedCreationParams ParseCreationParams(
+diff --git third_party/blink/renderer/core/workers/global_scope_creation_params.h third_party/blink/renderer/core/workers/global_scope_creation_params.h
+index b9901c1df106b..f82e1cfed9ba6 100644
+--- third_party/blink/renderer/core/workers/global_scope_creation_params.h
++++ third_party/blink/renderer/core/workers/global_scope_creation_params.h
+@@ -5,6 +5,8 @@
+ #ifndef THIRD_PARTY_BLINK_RENDERER_CORE_WORKERS_GLOBAL_SCOPE_CREATION_PARAMS_H_
+ #define THIRD_PARTY_BLINK_RENDERER_CORE_WORKERS_GLOBAL_SCOPE_CREATION_PARAMS_H_
+ 
++#include <array>
++#include <cstdint>
+ #include <memory>
+ #include <optional>
+ 
+@@ -270,6 +272,28 @@ struct CORE_EXPORT GlobalScopeCreationParams final {
+   mojo::PendingReceiver<mojom::blink::ReportingObserver>
+       coep_reporting_observer;
+   mojo::PendingReceiver<mojom::blink::ReportingObserver> dip_reporting_observer;
++
++  // --- Hodos farbling (P4f) --------------------------------------------------
++  // The parent context's per-origin farbling material, carried to the new global
++  // scope so a worker farbles exactly as the document that created it does.
++  //
++  // ⚠️ DEFAULTED PUBLIC FIELDS, SET AFTER CONSTRUCTION -- deliberately not
++  // constructor parameters. GlobalScopeCreationParams is also constructed by shared
++  // workers, service workers and every worklet; adding parameters would touch all of
++  // those call sites (and their tests) for no behavioural gain, and would enlarge the
++  // rebase surface of a patch that has to survive every Chromium bump. Left at their
++  // defaults, those paths keep exactly today's behaviour: no key, so the new scope
++  // fails closed to native values.
++  //
++  // ⛔ hodos_farbling_has_key IS SEPARATE FROM THE KEY AND MUST STAY SEPARATE. A
++  // zero-filled key flagged valid is the shipped constant-seed bug reintroduced --
++  // every user farbled identically, which is a WORSE fingerprint than none. And
++  // `enabled` is separate again, because an auth-exempt parent must propagate
++  // "keyed but not farbling" rather than "no key": the exemption depends on a true
++  // native pass-through, not on a differently-seeded farble.
++  std::array<uint8_t, 32> hodos_farbling_key{};
++  bool hodos_farbling_has_key = false;
++  bool hodos_farbling_enabled = false;
+ };
+ 
+ }  // namespace blink

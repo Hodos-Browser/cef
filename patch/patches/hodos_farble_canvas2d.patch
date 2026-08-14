@@ -1,5 +1,5 @@
 diff --git third_party/blink/renderer/core/html/canvas/html_canvas_element.cc third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
-index ce8231f02d134..7b4a5f0a23289 100644
+index ce8231f02d134..360f26e3a39ea 100644
 --- third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
 +++ third_party/blink/renderer/core/html/canvas/html_canvas_element.cc
 @@ -67,6 +67,7 @@
@@ -10,106 +10,15 @@ index ce8231f02d134..7b4a5f0a23289 100644
  #include "third_party/blink/renderer/core/fileapi/file.h"
  #include "third_party/blink/renderer/core/frame/local_dom_window.h"
  #include "third_party/blink/renderer/core/frame/local_frame.h"
-@@ -125,12 +126,16 @@
- #include "third_party/blink/renderer/platform/graphics/static_bitmap_image.h"
- #include "third_party/blink/renderer/platform/graphics/static_bitmap_image_to_video_frame_copier.h"
- #include "third_party/blink/renderer/platform/graphics/static_bitmap_image_transform.h"
-+#include "third_party/blink/renderer/platform/graphics/unaccelerated_static_bitmap_image.h"
- #include "third_party/blink/renderer/platform/graphics/web_graphics_context_3d_video_frame_pool.h"
- #include "third_party/blink/renderer/platform/heap/thread_state.h"
- #include "third_party/blink/renderer/platform/image-encoders/image_encoder_utils.h"
- #include "third_party/blink/renderer/platform/instrumentation/use_counter.h"
- #include "third_party/blink/renderer/platform/runtime_enabled_features.h"
- #include "third_party/blink/renderer/platform/wtf/functional.h"
-+#include "third_party/skia/include/core/SkData.h"
-+#include "third_party/skia/include/core/SkImage.h"
-+#include "third_party/skia/include/core/SkImageInfo.h"
- #include "ui/base/resource/resource_scale_factor.h"
- #include "ui/gfx/geometry/rect_conversions.h"
- #include "ui/gfx/geometry/size_conversions.h"
-@@ -1297,6 +1302,81 @@ scoped_refptr<StaticBitmapImage> HTMLCanvasElement::Snapshot(
+@@ -1297,6 +1298,7 @@ scoped_refptr<StaticBitmapImage> HTMLCanvasElement::Snapshot(
    return image_bitmap;
  }
  
-+namespace {
-+
-+// --- Hodos farbling (C3) ---------------------------------------------------
-+// Returns a farbled COPY of `snapshot`, or `snapshot` itself when farbling is off
-+// for this execution context (no key delivered, auth-domain exemption, or the
-+// user's per-site Privacy Shield toggle -- the browser process collapses all
-+// three into one bit and the renderer does not re-decide).
-+//
-+// IT MUST BE A COPY, and that is a correctness requirement rather than hygiene.
-+// A snapshot can share pixels with the canvas's own backing store, and the
-+// injected JavaScript this replaces farbled toDataURL by doing a getImageData ->
-+// putImageData round-trip -- i.e. by writing perturbed pixels back INTO the
-+// canvas. Because PerturbPixels is deterministic, a second read of an
-+// already-perturbed canvas re-flips exactly the same bits and silently UNDOES the
-+// first farble. Copying leaves the canvas pristine, so every read returns the
-+// same farbled bytes, which is the intra-session consistency the whole scheme
-+// depends on (an unstable fingerprint is itself a fingerprint).
-+scoped_refptr<StaticBitmapImage> HodosFarbleSnapshot(
-+    ExecutionContext* execution_context,
-+    scoped_refptr<StaticBitmapImage> snapshot) {
-+  if (!execution_context || !snapshot) {
-+    return snapshot;
-+  }
-+  HodosSessionCache& cache = HodosSessionCache::From(*execution_context);
-+  if (!cache.FarblingEnabled()) {
-+    return snapshot;
-+  }
-+
-+  auto paint_image = snapshot->PaintImageForCurrentFrame();
-+  if (!paint_image) {
-+    return snapshot;
-+  }
-+  const SkImageInfo source_info = paint_image.GetSkImageInfo();
-+  if (source_info.isEmpty()) {
-+    return snapshot;
-+  }
-+
-+  // Read back into a canonical unpremultiplied RGBA8888 buffer.
-+  //   * RGBA8888 so that PerturbPixels's "low bit of byte 0" is literally the red
-+  //     channel whatever the source's native byte order is, and so a float-storage
-+  //     (HDR) canvas is CONVERTED rather than reinterpreted as bytes.
-+  //   * Unpremultiplied because that is what the image encoders want and what
-+  //     ImageDataBuffer converts to anyway for every accelerated canvas
-+  //     (image_data_buffer.cc does this same readPixels for exactly that reason).
-+  //     It also keeps the perturbation from producing an invalid premultiplied
-+  //     pixel where red could exceed alpha.
-+  const SkImageInfo info =
-+      SkImageInfo::Make(source_info.width(), source_info.height(),
-+                        kRGBA_8888_SkColorType, kUnpremul_SkAlphaType,
-+                        source_info.refColorSpace());
-+  const size_t row_bytes = info.minRowBytes();
-+  const size_t size = info.computeByteSize(row_bytes);
-+  if (SkImageInfo::ByteSizeOverflowed(size) || size == 0) {
-+    return snapshot;
-+  }
-+
-+  sk_sp<SkData> pixels = SkData::MakeUninitialized(size);
-+  if (!paint_image.readPixels(info, pixels->writable_data(), row_bytes, 0, 0)) {
-+    return snapshot;
-+  }
-+  cache.PerturbPixels(static_cast<uint8_t*>(pixels->writable_data()), size);
-+
-+  sk_sp<SkImage> farbled =
-+      SkImages::RasterFromData(info, std::move(pixels), row_bytes);
-+  if (!farbled) {
-+    return snapshot;
-+  }
-+  // Unpremultiplied raster means ImageDataBuffer takes its peekPixels path over
-+  // OUR private buffer -- no second GPU readback, and nothing else can observe it.
-+  return UnacceleratedStaticBitmapImage::Create(std::move(farbled),
-+                                                snapshot->Orientation());
-+}
-+
-+}  // namespace
 +
  String HTMLCanvasElement::ToDataURLInternal(
      const String& mime_type,
      const double& quality,
-@@ -1310,6 +1390,15 @@ String HTMLCanvasElement::ToDataURLInternal(
+@@ -1310,6 +1312,15 @@ String HTMLCanvasElement::ToDataURLInternal(
            mime_type, ImageEncoderUtils::kEncodeReasonToDataURL);
  
    scoped_refptr<StaticBitmapImage> image_bitmap = Snapshot(source_buffer);
@@ -125,7 +34,7 @@ index ce8231f02d134..7b4a5f0a23289 100644
    if (image_bitmap) {
      std::unique_ptr<ImageDataBuffer> data_buffer =
          ImageDataBuffer::Create(image_bitmap);
-@@ -1421,6 +1510,13 @@ void HTMLCanvasElement::toBlob(V8BlobCallback* callback,
+@@ -1421,6 +1432,13 @@ void HTMLCanvasElement::toBlob(V8BlobCallback* callback,
  
    CanvasAsyncBlobCreator* async_creator = nullptr;
    scoped_refptr<StaticBitmapImage> image_bitmap = Snapshot(kBackBuffer);

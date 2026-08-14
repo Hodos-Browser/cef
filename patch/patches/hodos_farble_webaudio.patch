@@ -1,5 +1,5 @@
 diff --git third_party/blink/renderer/modules/webaudio/analyser_node.cc third_party/blink/renderer/modules/webaudio/analyser_node.cc
-index 688a2fec77ee2..25ec84fc9c842 100644
+index 688a2fec77ee2..1b32f8e939dd8 100644
 --- third_party/blink/renderer/modules/webaudio/analyser_node.cc
 +++ third_party/blink/renderer/modules/webaudio/analyser_node.cc
 @@ -26,6 +26,8 @@
@@ -11,7 +11,7 @@ index 688a2fec77ee2..25ec84fc9c842 100644
  #include "third_party/blink/renderer/modules/webaudio/analyser_handler.h"
  #include "third_party/blink/renderer/modules/webaudio/audio_graph_tracer.h"
  #include "third_party/blink/renderer/modules/webaudio/base_audio_context.h"
-@@ -119,6 +121,23 @@ double AnalyserNode::smoothingTimeConstant() const {
+@@ -119,19 +121,84 @@ double AnalyserNode::smoothingTimeConstant() const {
  void AnalyserNode::getFloatFrequencyData(NotShared<DOMFloat32Array> array) {
    GetAnalyserHandler().GetFloatFrequencyData(array.Get(),
                                               context()->currentTime());
@@ -35,6 +35,67 @@ index 688a2fec77ee2..25ec84fc9c842 100644
  }
  
  void AnalyserNode::getByteFrequencyData(NotShared<DOMUint8Array> array) {
+   GetAnalyserHandler().GetByteFrequencyData(array.Get(),
+                                             context()->currentTime());
++
++  // --- Hodos farbling (P4f) ------------------------------------------------
++  // MEASURED unfarbled 2026-08-14: this path converts magnitudes to bytes inside
++  // RealtimeAnalyser and never touches the hooked getFloatFrequencyData, so hooking
++  // that one covered nothing here.
++  //
++  // ⛔ PerturbBytes, NOT PerturbAudioSamples. These values are already quantised to
++  // [0, 255], and the audio multiplier on an integer that small either does nothing
++  // at all or subtracts exactly 1 from every byte -- see HodosSessionCache::
++  // PerturbBytes for the full reasoning. Using the multiplier here would look right
++  // and protect nobody.
++  //
++  // Like getFloatFrequencyData, `array` is the caller's destination and the handler
++  // refills it from scratch every call, so a deterministic perturbation reproduces
++  // the same values rather than compounding. No once-only bookkeeping needed.
++  if (array) {
++    if (ExecutionContext* execution_context = GetExecutionContext()) {
++      HodosSessionCache::From(*execution_context)
++          .PerturbBytes(array->Data(), array->length(),
++                        HodosSessionCache::Stream::kAnalyserByteFrequency);
++    }
++  }
+ }
+ 
+ void AnalyserNode::getFloatTimeDomainData(NotShared<DOMFloat32Array> array) {
+   GetAnalyserHandler().GetFloatTimeDomainData(array.Get());
++
++  // --- Hodos farbling (P4f) ------------------------------------------------
++  // MEASURED unfarbled 2026-08-14. These are float32 samples in the same nominal
++  // [-1, 1] domain as AudioBuffer::getChannelData, so the multiplier IS the right
++  // mechanism here -- and its delta floor is what makes it effective rather than a
++  // float32 no-op. Caller-owned destination, refilled per call, so no bookkeeping.
++  if (array) {
++    if (ExecutionContext* execution_context = GetExecutionContext()) {
++      HodosSessionCache::From(*execution_context)
++          .PerturbAudioSamples(array->Data(), array->length());
++    }
++  }
+ }
+ 
+ void AnalyserNode::getByteTimeDomainData(NotShared<DOMUint8Array> array) {
+   GetAnalyserHandler().GetByteTimeDomainData(array.Get());
++
++  // --- Hodos farbling (P4f) ------------------------------------------------
++  // MEASURED unfarbled 2026-08-14. Quantised to [0, 255] by RealtimeAnalyser
++  // (`128 * (value + 1)`, clamped), so PerturbBytes for the same reason as
++  // getByteFrequencyData above. Its own stream: a site can read both arrays side by
++  // side, and sharing a stream between two readable surfaces is what lets a caller
++  // correlate them.
++  if (array) {
++    if (ExecutionContext* execution_context = GetExecutionContext()) {
++      HodosSessionCache::From(*execution_context)
++          .PerturbBytes(array->Data(), array->length(),
++                        HodosSessionCache::Stream::kAnalyserByteTimeDomain);
++    }
++  }
+ }
+ 
+ void AnalyserNode::ReportDidCreate() {
 diff --git third_party/blink/renderer/modules/webaudio/audio_buffer.cc third_party/blink/renderer/modules/webaudio/audio_buffer.cc
 index bc4c0c6ca00c1..55b4cafa22aec 100644
 --- third_party/blink/renderer/modules/webaudio/audio_buffer.cc

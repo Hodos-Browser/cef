@@ -1,0 +1,35 @@
+diff --git third_party/blink/renderer/core/offscreencanvas/offscreen_canvas.cc third_party/blink/renderer/core/offscreencanvas/offscreen_canvas.cc
+index 229ed841fc8fb..8b58d1b174781 100644
+--- third_party/blink/renderer/core/offscreencanvas/offscreen_canvas.cc
++++ third_party/blink/renderer/core/offscreencanvas/offscreen_canvas.cc
+@@ -20,6 +20,7 @@
+ #include "third_party/blink/renderer/core/css/style_engine.h"
+ #include "third_party/blink/renderer/core/dom/document.h"
+ #include "third_party/blink/renderer/core/execution_context/execution_context.h"
++#include "third_party/blink/renderer/core/execution_context/hodos_session_cache.h"
+ #include "third_party/blink/renderer/core/fileapi/blob.h"
+ #include "third_party/blink/renderer/core/frame/local_dom_window.h"
+ #include "third_party/blink/renderer/core/frame/local_frame.h"
+@@ -431,6 +432,22 @@ ScriptPromise<Blob> OffscreenCanvas::convertToBlob(
+ 
+   base::TimeTicks start_time = base::TimeTicks::Now();
+   scoped_refptr<StaticBitmapImage> image_bitmap = context_->GetImage();
++  // --- Hodos farbling (P4f) --------------------------------------------------
++  // MEASURED unfarbled 2026-08-14, and this is NOT a worker-only gap: OffscreenCanvas
++  // exists on the main thread too, so before this hook a top-level page could read an
++  // unfarbled PNG encoding of the very canvas getImageData farbles -- native
++  // convertToBlob and native toBlob hash IDENTICALLY, which is what proves they encode
++  // the same image and only one of them was perturbed.
++  //
++  // Same helper and the same call-site size gate as HTMLCanvasElement's two encode
++  // callers, deliberately: the three are one surface reached three ways, and a
++  // separate implementation here is how they would drift apart.
++  if (static_cast<int64_t>(Size().width()) *
++          static_cast<int64_t>(Size().height()) <
++      65536) {
++    image_bitmap = HodosFarbleSnapshot(ExecutionContext::From(script_state),
++                                       std::move(image_bitmap));
++  }
+   if (image_bitmap) {
+     auto* resolver = MakeGarbageCollected<ScriptPromiseResolver<Blob>>(
+         script_state, exception_state.GetContext());
